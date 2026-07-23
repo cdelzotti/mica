@@ -40,12 +40,8 @@ if("${NDEBUG}" STREQUAL "yes")
 endif()
 
 SET(NLOCAL "$ENV{NLOCAL}" CACHE STRING "no local programs")
-SET(NCLIENT "$ENV{NCLIENT}" CACHE STRING "no clients")
-SET(NSERVER "$ENV{NSERVER}" CACHE STRING "no servers")
 
 message(STATUS "NLOCAL (do not compile local programs; no*, yes) = ${NLOCAL}")
-message(STATUS "NCLIENT (do not compile clients; no*, yes) = ${NCLIENT}")
-message(STATUS "NSERVER (do not compile server; no*, yes) = ${NSERVER}")
 
 # common source files
 set(SOURCES ${SOURCES} hash.c)
@@ -93,39 +89,21 @@ if(NOT "${NLOCAL}" STREQUAL "yes")
 	target_link_libraries(netbench_analysis ${LIBRARIES})
 endif()
 
-if(NOT "${NCLIENT}" STREQUAL "yes")
-	# netbench_client
-	add_executable(netbench_client net_common.c netbench_config.c netbench_client.c ${SOURCES})
-	target_link_libraries(netbench_client ${LIBRARIES})
+# netbench_server
+add_executable(netbench_server net_common.c netbench_config.c netbench_server.c ${SOURCES})
+target_link_libraries(netbench_server ${LIBRARIES})
 
-	# netbench_client_latency
-	add_executable(netbench_client_latency net_common.c netbench_config.c netbench_client.c ${SOURCES})
-	set_target_properties(netbench_client_latency PROPERTIES COMPILE_FLAGS "-DMEHCACHED_MEASURE_LATENCY")
-	target_link_libraries(netbench_client_latency ${LIBRARIES})
+# netbench_server_latency
+add_executable(netbench_server_latency net_common.c netbench_config.c netbench_server.c ${SOURCES})
+set_target_properties(netbench_server_latency PROPERTIES COMPILE_FLAGS "-DMEHCACHED_MEASURE_LATENCY")
+target_link_libraries(netbench_server_latency ${LIBRARIES})
 
-	# netbench_client_soft_fdir
-	add_executable(netbench_client_soft_fdir net_common.c netbench_config.c netbench_client.c ${SOURCES})
-	set_target_properties(netbench_client_soft_fdir PROPERTIES COMPILE_FLAGS "-DMEHCACHED_USE_SOFT_FDIR")
-	target_link_libraries(netbench_client_soft_fdir ${LIBRARIES})
-endif()
+# netbench_server_soft_fdir
+add_executable(netbench_server_soft_fdir net_common.c netbench_config.c netbench_server.c ${SOURCES})
+set_target_properties(netbench_server_soft_fdir PROPERTIES COMPILE_FLAGS "-DMEHCACHED_USE_SOFT_FDIR")
+target_link_libraries(netbench_server_soft_fdir ${LIBRARIES})
 
-if(NOT "${NSERVER}" STREQUAL "yes")
-	# netbench_server
-	add_executable(netbench_server net_common.c netbench_config.c netbench_server.c ${SOURCES})
-	target_link_libraries(netbench_server ${LIBRARIES})
-
-	# netbench_server_latency
-	add_executable(netbench_server_latency net_common.c netbench_config.c netbench_server.c ${SOURCES})
-	set_target_properties(netbench_server_latency PROPERTIES COMPILE_FLAGS "-DMEHCACHED_MEASURE_LATENCY")
-	target_link_libraries(netbench_server_latency ${LIBRARIES})
-
-	# netbench_server_soft_fdir
-	add_executable(netbench_server_soft_fdir net_common.c netbench_config.c netbench_server.c ${SOURCES})
-	set_target_properties(netbench_server_soft_fdir PROPERTIES COMPILE_FLAGS "-DMEHCACHED_USE_SOFT_FDIR")
-	target_link_libraries(netbench_server_soft_fdir ${LIBRARIES})
-
-	# netbench_server_store
-	add_executable(netbench_server_store net_common.c netbench_config.c netbench_server.c ${SOURCES})
-	set_target_properties(netbench_server_store PROPERTIES COMPILE_FLAGS "-DMEHCACHED_NO_EVICTION")
-	target_link_libraries(netbench_server_store ${LIBRARIES})
-endif()
+# netbench_server_store
+add_executable(netbench_server_store net_common.c netbench_config.c netbench_server.c ${SOURCES})
+set_target_properties(netbench_server_store PROPERTIES COMPILE_FLAGS "-DMEHCACHED_NO_EVICTION")
+target_link_libraries(netbench_server_store ${LIBRARIES})

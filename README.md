@@ -4,16 +4,26 @@ MICA
 A fast in-memory key-value store.
 
 
+A note on the client
+---------------------
+
+MICA no longer ships its own load-generating client (the old `netbench_client*` executables and
+the `mehcached_workload_conf`/`mehcached_get_workload_conf` config format that drove them are gone).
+Generating and sending requests into `netbench_server` is the caller's responsibility -- use
+whatever external packet generator or test harness you like. Whatever you use needs to speak
+MICA's wire format (see `src/proto.h` for the packet layout and `mehcached_hash_key()` in
+`src/netbench_server.c` for the key-hashing scheme that determines partition ownership/routing).
+
+
 Hardware Requirements
 ---------------------
 
- * Dual CPU system
  * NICs supported by DPDK, with a PMD that implements `rte_flow` ETH/IPV4/UDP matching + a QUEUE
    action (the original 2014 code assumed Intel 82599 "ixgbe" 10 GbE NICs specifically and its own
    Flow Director filters; see "A note on DPDK version" below for why that changed).
- * Note: The current codebase has several assumptions on the hardware configuration of the server and clients.
-         It runs ideally on a dual octa-core server with 4 dual-port 10 GbE NICs, and clients with 2 dual-port 10 GbE NICs.
- * `netbench_server.c`/`netbench_client.c` also hardcode a couple of PCI addresses to blacklist
+ * Note: The current codebase has several assumptions on the hardware configuration of the server.
+         It runs ideally on a dual octa-core server with 4 dual-port 10 GbE NICs.
+ * `netbench_server.c` also hardcodes a couple of PCI addresses to blacklist
    (`"-b", "0000:06:00.0"`, `"-b", "0000:06:00.1"` in `mehcached_benchmark_server()`), left over from
    the original 2014 test machine. These almost certainly don't match your hardware's PCI addresses,
    so update or remove those `-b` arguments for your machine before running.
@@ -58,12 +68,11 @@ and `ninja install`), discovered the standard modern way via `pkg-config libdpdk
 Executables
 -----------
 
- * build/netbench_server: MICA server in cache mode (use with netbench_client)
- * build/netbench_server_store: MICA server in store mode (use with netbench_client)
- * build/netbench_server_latency: MICA server in cache mode modified for end-to-end latency measurement (use with netbench_client_latency)
- * build/netbench_server_soft_fdir: MICA server in cache mode using software-based request direction (use with netbench_client_soft_fdir)
- * build/netbench_client*: MICA clients
- * build/netbench_analysis: workload analyzer (used for generating preset configurations)
+ * build/netbench_server: MICA server in cache mode
+ * build/netbench_server_store: MICA server in store mode
+ * build/netbench_server_latency: MICA server in cache mode modified for end-to-end latency measurement
+ * build/netbench_server_soft_fdir: MICA server in cache mode using software-based request direction
+ * build/netbench_analysis: workload analyzer (used for generating preset server configurations)
  * build/microbench: a local microbenchmark for MICA in cache mode
  * build/microbench_store: a local microbenchmark for MICA in store mode
  * build/test: a simple feature test program
@@ -82,13 +91,13 @@ any more.
 	$ cmake ..
 	$ make
 
-This is exactly what the bundled `configure_all.sh`/`configure_server.sh`/`configure_client.sh`
-wrapper scripts do (they just set a couple of `cmake` cache variables first -- `NDEBUG=yes` to
-disable extra runtime checks, and `NSERVER`/`NCLIENT` to skip building the server- or client-only
-executables):
+This is exactly what the bundled `configure_all.sh`/`configure_server.sh` wrapper scripts do (they
+just set a `cmake` cache variable first -- `NDEBUG=yes` to disable extra runtime checks; `configure_server.sh`
+is currently equivalent to `configure_all.sh` since there are no client-only executables left to
+distinguish it from):
 
 	$ cd mica
-	$ ./configure_all.sh	# or configure_server.sh / configure_client.sh
+	$ ./configure_all.sh	# or configure_server.sh
 	$ cd build
 	$ make
 
@@ -96,7 +105,7 @@ executables):
 Generating Configuration Files
 ------------------------------
 
-	# conf_* files determine how MICA uses system resources. build/gen_confs.py generates a preset of configuration files for a 16-core server and 12-core clients
+	# conf_* files determine how MICA uses system resources. build/gen_confs.py generates a preset of server configuration files for a 16-core server
 	# in mica
 	$ ./run_analysis_for_conf.py	# this uses sudo
 	$ ./gen_confs.py
@@ -106,16 +115,11 @@ Running a Server
 ----------------
 
 	# in mica/build
-	$ sudo ./netbench_server conf_machines_DATASET_CMODE_0.5 server 0 0 conf_prepopulation_empty
+	$ sudo ./netbench_server conf_machines_DATASET_CMODE_0.5 server 0 conf_prepopulation_empty
 	# DATASET=0,1,2 (used to determine how much memory to allocate); CMODE=EREW,CREW,CRCWS (specifies the data access mode)
 
-
-Running a Client (e.g., client0)
---------------------------------
-
-	# in mica/build
-	$ sudo ./netbench_client conf_machines_DATASET_CMODE_0.5 client0 0 0 conf_workload_DATASET_SKEW_GET_PUT_0.00_1
-	# DATASET=0,1,2 (specifies the dataset to use); SKEW=uniform,skewed,single (specifies the workload skew); GET/PUT=0.00,0.50,0.95,1.00 (specifies the read/write ratio)
+There is no bundled client any more -- see "A note on the client" above for how to send requests
+into a running server.
 
 
 Running a Local Microbenchmark

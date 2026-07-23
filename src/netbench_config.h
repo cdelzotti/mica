@@ -20,23 +20,13 @@
 //#define MEHCACHED_MAX_PORTS (8)
 #define MEHCACHED_MAX_THREADS (16)
 #define MEHCACHED_MAX_PARTITIONS (64)
-#define MEHCACHED_MAX_WORKLOAD_THREADS (16)
 #define MEHCACHED_MAX_HOT_ITEMS (64)
-
-
-// common
-struct mehcached_port_conf
-{
-	uint8_t mac_addr[6];
-	uint8_t ip_addr[4];
-};
 
 
 // server
 struct mehcached_server_thread_conf
 {
-	uint8_t num_ports;
-	uint8_t port_ids[MEHCACHED_MAX_PORTS];
+	uint8_t port_id;	// each server thread polls a single fixed queue on a single port -- no per-thread port list any more
 };
 
 struct mehcached_server_partition_conf
@@ -58,9 +48,8 @@ struct mehcached_server_hot_item_conf
 
 struct mehcached_server_conf
 {
-	uint8_t num_ports;
-	struct mehcached_port_conf ports[MEHCACHED_MAX_PORTS];
-	uint8_t num_threads;
+	uint8_t num_ports;	// not read from config at all any more -- set from however many ports
+				// DPDK actually reports (see mehcached_init_network()/netbench_server.c)
 	struct mehcached_server_thread_conf threads[MEHCACHED_MAX_THREADS];
 	uint16_t num_partitions;
 	struct mehcached_server_partition_conf partitions[MEHCACHED_MAX_PARTITIONS];
@@ -73,15 +62,6 @@ struct mehcached_server_conf
 #define MEHCACHED_CONCURRENT_ALLOC_WRITE(server_conf, partition_id) ((server_conf)->partitions[partition_id].concurrent_alloc_write)
 
 
-// client
-struct mehcached_client_conf
-{
-	uint8_t num_ports;
-	struct mehcached_port_conf ports[MEHCACHED_MAX_PORTS];
-	uint8_t num_threads;
-};
-
-
 // prepopulation
 struct mehcached_prepopulation_conf
 {
@@ -92,41 +72,9 @@ struct mehcached_prepopulation_conf
 };
 
 
-// workload
-struct mehcached_workload_thread_conf
-{
-	uint8_t num_ports;
-	uint8_t port_ids[MEHCACHED_MAX_PORTS];
-	char server_name[64];
-	int8_t partition_mode;
-	uint64_t num_items;
-	size_t key_length;
-	size_t value_length;
-	double zipf_theta;
-	uint8_t batch_size;
-	double get_ratio;
-	double put_ratio;
-	double increment_ratio;
-	uint64_t num_operations;
-	double duration;
-};
-
-struct mehcached_workload_conf
-{
-	uint8_t num_threads;
-	struct mehcached_workload_thread_conf threads[MEHCACHED_MAX_WORKLOAD_THREADS];
-};
-
-
 // functions
 struct mehcached_server_conf *
 mehcached_get_server_conf(const char *filename, const char *server_name);
 
-struct mehcached_client_conf *
-mehcached_get_client_conf(const char *filename, const char *client_name);
-
 struct mehcached_prepopulation_conf *
 mehcached_get_prepopulation_conf(const char *filename, const char *server_name);
-
-struct mehcached_workload_conf *
-mehcached_get_workload_conf(const char *filename, const char *client_name);

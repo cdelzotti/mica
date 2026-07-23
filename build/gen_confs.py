@@ -3,16 +3,12 @@
 class ServerConf:
     def __init__(self, server_name):
         self.server_name = server_name
-        self.ports = []
         self.threads = []
         self.partitions = []
         self.hot_items = []
 
-    def add_port(self, mac_addr, ip_addr):
-        self.ports.append((mac_addr, ip_addr))
-
-    def add_thread(self, port_ids):
-        self.threads.append(port_ids)
+    def add_thread(self, port_id):
+        self.threads.append(port_id)
 
     def add_partition(self, num_items, alloc_size, concurrent_table_read, concurrent_table_write, concurrent_alloc_write, thread_id, mth_threshold):
         self.partitions.append((num_items, alloc_size, concurrent_table_read, concurrent_table_write, concurrent_alloc_write, thread_id, mth_threshold))
@@ -22,34 +18,14 @@ class ServerConf:
 
     def write(self, f):
         f.write('server,%s\n' % self.server_name)
-        for port in self.ports:
-            f.write('server_port,%s,%s\n' % port)
-        for thread in self.threads:
-            f.write('server_thread,%s\n' % ' '.join([str(port_id) for port_id in thread]))
+        # port count is no longer part of the config at all: the server queries however many
+        # ports DPDK actually reports at startup (see net_common.c/netbench_server.c).
+        for port_id in self.threads:
+            f.write('server_thread,%s\n' % port_id)
         for partition in self.partitions:
             f.write('server_partition,%s,%s,%s,%s,%s,%s,%s\n' % partition)
         for hot_item in self.hot_items:
             f.write('server_hot_item,%016x,%s\n' % hot_item)
-        f.write('\n')
-
-class ClientConf:
-    def __init__(self, client_name):
-        self.client_name = client_name
-        self.ports = []
-        self.threads = []
-
-    def add_port(self, mac_addr, ip_addr):
-        self.ports.append((mac_addr, ip_addr))
-
-    def add_thread(self):
-        self.threads.append(None)
-
-    def write(self, f):
-        f.write('client,%s\n' % self.client_name)
-        for thread in self.threads:
-            f.write('client_thread,\n')
-        for port in self.ports:
-            f.write('client_port,%s,%s\n' % port)
         f.write('\n')
 
 class PrePopulationConf:
@@ -64,50 +40,6 @@ class PrePopulationConf:
         f.write('prepopulation,%s\n' % self.server_name)
         f.write('dataset,%s,%s,%s\n' % self.dataset)
         f.write('\n')
-
-class WorkloadConf:
-    def __init__(self, client_name):
-        self.client_name = client_name
-        self.threads = []
-
-    def add_thread(self, port_ids, server_name, partition_mode, num_items, key_length, value_length, zipf_theta, get_ratio, put_ratio, increment_ratio, batch_size, num_operations, duration):
-        assert abs(get_ratio) + abs(put_ratio) + abs(increment_ratio) == 1.
-        self.threads.append((port_ids, server_name, partition_mode, num_items, key_length, value_length, zipf_theta, get_ratio, put_ratio, increment_ratio, batch_size, num_operations, duration))
-
-    def write(self, f):
-        f.write('workload,%s\n' % self.client_name)
-        for thread in self.threads:
-            f.write('workload_thread,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' % (
-                ' '.join([str(port_id) for port_id in thread[0]]),
-                thread[1],
-                thread[2],
-                thread[3],
-                thread[4],
-                thread[5],
-                thread[6],
-                thread[7],
-                thread[8],
-                thread[9],
-                thread[10],
-                thread[11],
-                thread[12]
-                ))
-        f.write('\n')
-
-def init_addr():
-    global _last_addr_id
-    _last_addr_id = 0
-
-def next_addr():
-    global _last_addr_id
-
-    addr_id = _last_addr_id
-    _last_addr_id += 1
-
-    mac_addr = '80:00:00:00:00:{:02}'.format(addr_id)
-    ip_addr = '10.0.0.{}'.format(addr_id)
-    return mac_addr, ip_addr
-
 
 class ConcurrencyModel:
     def concurrent_table_read(self, partition_id): pass
@@ -185,13 +117,6 @@ def main():
         assert key_length >= len('%x' % (num_items - 1))    # for hexadecimal key
         #num_partitions = 64
         num_partitions = 16
-        # the following should be the same as in run_analysis_for_conf.py
-        # isolated_server_numa_nodes = True
-        isolated_server_numa_nodes = False
-
-        # the followings are always 0 to allow exp.py to control duration
-        load_duration = 0.
-        trans_duration = 0.
 
         concurrency_list = [EREW(), CREW(), CRCW(), CRCWS(), CREW0()]
         for num_hot_items in (0, 32):
@@ -203,16 +128,12 @@ def main():
 
         for concurrency in concurrency_list:
             for mth_threshold in mth_threshold_list:
-                init_addr()
-
                 f = open('conf_machines_%s_%s_%s' % (dataset, concurrency.name, mth_threshold), 'w')
 
                 s = ServerConf('server')
-                for port_id in range(8):
-                    s.add_port(*next_addr())
                 for thread_id in range(0, 16, 2):
-                    s.add_thread(list(range(0, 4)))
-                    s.add_thread(list(range(4, 8)))
+                    s.add_thread(0)
+                    s.add_thread(4)
                 for partition_id in range(num_partitions):
                     num_items_per_partition = num_items / num_partitions
                     alloc_size_per_partition = num_items * (key_length + value_length) / num_partitions
@@ -226,96 +147,10 @@ def main():
                     s.add_hot_item(*hot_item)
                 s.write(f)
 
-                c0 = ClientConf('client0')
-                for port in range(4):
-                    c0.add_port(*next_addr())
-                for thread_id in range(12):
-                    c0.add_thread()
-                c0.write(f)
-
-                c1 = ClientConf('client1')
-                for port in range(4):
-                    c1.add_port(*next_addr())
-                for thread_id in range(12):
-                    c1.add_thread()
-                c1.write(f)
-
         f = open('conf_prepopulation_%s' % dataset, 'w')
         p = PrePopulationConf('server')
         p.set(num_items, key_length, value_length)
         p.write(f)
-
-        for zipf in (('uniform', 0.), ('skewed', 0.99), ('single', 99.)):
-            # load operations
-            f = open('conf_workload_%s_load_%s' % (dataset, zipf[0]), 'w')
-            if zipf[1] == 0.:
-                # use sequential uniform instead for fast ingest
-                zipf_theta = -1.0
-            else:
-                # other skewed distributions usually allow fast ingest
-                zipf_theta = zipf[1]
-            get_ratio = 0.
-            put_ratio = 1. - get_ratio
-            increment_ratio = 0.
-            load_batch_size = 1
-            num_operations = 0
-            duration = load_duration
-            w = WorkloadConf(c0.client_name)
-            for thread_id in range(12):
-                if isolated_server_numa_nodes:
-                    w.add_thread(list(range(4)), s.server_name, 0, num_items, key_length, value_length, zipf_theta, get_ratio, put_ratio, increment_ratio, load_batch_size, num_operations, duration)
-                else:
-                    w.add_thread(list(range(4)), s.server_name, -1, num_items, key_length, value_length, zipf_theta, get_ratio, put_ratio, increment_ratio, load_batch_size, num_operations, duration)
-            w.write(f)
-            w = WorkloadConf(c1.client_name)
-            for thread_id in range(12):
-                if isolated_server_numa_nodes:
-                    w.add_thread(list(range(4)), s.server_name, 1, num_items, key_length, value_length, zipf_theta, get_ratio, put_ratio, increment_ratio, load_batch_size, num_operations, duration)
-                else:
-                    w.add_thread(list(range(4)), s.server_name, -1, num_items, key_length, value_length, zipf_theta, get_ratio, put_ratio, increment_ratio, load_batch_size, num_operations, duration)
-            w.write(f)
-
-            # trans operations
-            zipf_theta = zipf[1]
-            for get_ratio, put_ratio, increment_ratio in (
-                    (0., 1., 0.),
-                    (0.1, 0.9, 0.),
-                    (0.25, 0.75, 0.),
-                    (0.5, 0.5, 0.),
-                    (0.75, 0.25, 0.),
-                    (0.9, 0.1, 0.),
-                    (0.95, 0.05, 0.),
-                    (0.99, 0.01, 0.),
-                    (1., 0., 0.),
-                    (0., -1., 0.),
-                    (-0.1, -0.9, 0.),
-                    (-0.25, -0.75, 0.),
-                    (-0.5, -0.5, 0.),
-                    (-0.75, -0.25, 0.),
-                    (-0.9, -0.1, 0.),
-                    (-0.95, -0.05, 0.),
-                    (-0.99, -0.01, 0.),
-                    (-1., 0., 0.),
-                    (0., 0., 1.),
-                ):
-                for batch_size in (1, 2, 4, 8, 16, 32):
-                    f = open('conf_workload_%s_%s_%.2f_%.2f_%.2f_%s' % (dataset, zipf[0], get_ratio, put_ratio, increment_ratio, batch_size), 'w')
-                    num_operations = 0
-                    duration = trans_duration
-                    w = WorkloadConf(c0.client_name)
-                    for thread_id in range(12):
-                        if isolated_server_numa_nodes:
-                            w.add_thread(list(range(4)), s.server_name, 0, num_items, key_length, value_length, zipf_theta, get_ratio, put_ratio, increment_ratio, batch_size, num_operations, duration)
-                        else:
-                            w.add_thread(list(range(4)), s.server_name, -1, num_items, key_length, value_length, zipf_theta, get_ratio, put_ratio, increment_ratio, batch_size, num_operations, duration)
-                    w.write(f)
-                    w = WorkloadConf(c1.client_name)
-                    for thread_id in range(12):
-                        if isolated_server_numa_nodes:
-                            w.add_thread(list(range(4)), s.server_name, 1, num_items, key_length, value_length, zipf_theta, get_ratio, put_ratio, increment_ratio, batch_size, num_operations, duration)
-                        else:
-                            w.add_thread(list(range(4)), s.server_name, -1, num_items, key_length, value_length, zipf_theta, get_ratio, put_ratio, increment_ratio, batch_size, num_operations, duration)
-                    w.write(f)
 
 
 if __name__ == '__main__':

@@ -20,5 +20,5 @@ cd "$(dirname $0)/build" || exit 1
 
 rm -f CMakeCache.txt
 
-NDEBUG=yes NCLIENT=yes cmake ..
+NDEBUG=yes cmake ..
 
