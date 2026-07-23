@@ -25,7 +25,6 @@
 #include "proto.h"
 #include "stopwatch.h"
 #include "netbench_config.h"
-#include "netbench_hot_item_hash.h"
 #include "table.h"
 
 #include <rte_launch.h>
@@ -58,14 +57,13 @@
 #endif
 
 
-//#define USE_HOT_ITEMS
-
 struct server_state
 {
     struct mehcached_server_conf *server_conf;
     struct mehcached_prepopulation_conf *prepopulation_conf;
 #ifdef NETBENCH_SERVER_MEHCACHED
-    struct mehcached_table **partitions;
+    // a single instance serves exactly one partition -- see mehcached_server_conf.partition
+    struct mehcached_table *partition;
 #endif
 #ifdef NETBENCH_SERVER_MEMCACHED
     // memcached uses a singleton
@@ -77,9 +75,6 @@ struct server_state
     ramcloud_t ramcloud;
 #endif
 
-#ifdef USE_HOT_ITEMS
-    struct mehcached_hot_item_hash hot_item_hash;
-#endif
     uint32_t target_request_rate;   // target request rate (in ops) for each client thread
 
     int cpu_mode;
@@ -94,7 +89,6 @@ struct server_state
     uint64_t num_tx_dropped;
     uint64_t bytes_rx;
     uint64_t bytes_tx;
-    uint64_t num_per_partition_ops[MEHCACHED_MAX_PARTITIONS];
     uint64_t last_num_operations_done;
     uint64_t last_num_key0_operations_done;
     uint64_t last_num_operations_succeeded;
@@ -104,7 +98,6 @@ struct server_state
     uint64_t last_num_tx_dropped;
     uint64_t last_bytes_rx;
     uint64_t last_bytes_tx;
-    uint64_t last_num_per_partition_ops[MEHCACHED_MAX_PARTITIONS];
     uint16_t packet_size;
 
 #ifdef MEHCACHED_USE_SOFT_FDIR
@@ -131,19 +124,6 @@ signal_handler(int signum)
     else
         fprintf(stderr, "caught unknown signal\n");
     exiting = true;
-}
-
-static
-uint16_t
-mehcached_get_partition_id(struct server_state *state, uint64_t key_hash)
-{
-#ifdef USE_HOT_ITEMS
-    uint8_t hot_item_id = mehcached_get_hot_item_id(state->server_conf, &state->hot_item_hash, key_hash);
-    if (hot_item_id != (uint8_t)-1)
-        return (uint16_t)(state->server_conf->num_partitions + state->server_conf->hot_items[hot_item_id].thread_id);
-    else
-#endif
-        return (uint16_t)(key_hash >> 48) & (uint16_t)(state->server_conf->num_partitions - 1);
 }
 
 static
@@ -275,10 +255,6 @@ mehcached_benchmark_server_proc(void *arg)
     struct mehcached_server_conf *server_conf = state->server_conf;
     struct mehcached_server_thread_conf *thread_conf = &server_conf->threads[thread_id];
 
-#ifdef USE_HOT_ITEMS
-    mehcached_calc_hot_item_hash(state->server_conf, &state->hot_item_hash);
-#endif
-
     // for single core performance test
     // if (thread_id != 0 && thread_id != 1)
     //     return 0;
@@ -369,12 +345,6 @@ mehcached_benchmark_server_proc(void *arg)
         struct rte_mbuf *packet_mbufs[pipeline_size];
         // stage0
         struct mehcached_batch_packet *packets[pipeline_size];
-        // stage1
-#ifdef NETBENCH_SERVER_MEHCACHED
-#ifdef USE_HOT_ITEMS
-        uint16_t partition_ids[pipeline_size];
-#endif
-#endif
         // stage1 & stage2
 #ifdef NETBENCH_SERVER_MEHCACHED
         struct mehcached_prefetch_state prefetch_state[pipeline_size][MEHCACHED_MAX_BATCH_SIZE];
@@ -417,21 +387,18 @@ mehcached_benchmark_server_proc(void *arg)
                 struct rte_mbuf *mbuf = packet_mbufs[packet_index];
                 struct mehcached_batch_packet *packet = rte_pktmbuf_mtod(mbuf, struct mehcached_batch_packet *);
                 struct mehcached_request *req = (struct mehcached_request *)packet->data + 0;
-                uint64_t key_hash = req->key_hash;
-                uint16_t partition_id = mehcached_get_partition_id(state, key_hash);
-                uint8_t owner_thread_id = server_conf->partitions[partition_id].thread_id;
+                uint8_t owner_thread_id = server_conf->partition.thread_id;
                 uint8_t target_thread_id;
-                // XXX: this does not support hot items
                 if (req->operation == MEHCACHED_NOOP_READ || req->operation == MEHCACHED_GET)
                 {
-                    if (MEHCACHED_CONCURRENT_TABLE_READ(server_conf, partition_id))
+                    if (MEHCACHED_CONCURRENT_TABLE_READ(server_conf))
                         target_thread_id = thread_id;
                     else
                         target_thread_id = owner_thread_id;
                 }
                 else
                 {
-                    if (MEHCACHED_CONCURRENT_TABLE_WRITE(server_conf, partition_id))
+                    if (MEHCACHED_CONCURRENT_TABLE_WRITE(server_conf))
                         target_thread_id = thread_id;
                     else
                         target_thread_id = owner_thread_id;
@@ -501,25 +468,9 @@ mehcached_benchmark_server_proc(void *arg)
                     if (req->operation != MEHCACHED_NOOP_READ && req->operation != MEHCACHED_NOOP_WRITE)
                     {
                         uint64_t key_hash = req->key_hash;
-                        uint16_t partition_id;
-#ifdef USE_HOT_ITEMS
-                        if (request_index == 0)
-                            partition_id = partition_ids[stage1_index] = mehcached_get_partition_id(state, key_hash);
-                        else
-                        {
-                            partition_id = partition_ids[stage1_index];
-                            assert(partition_id == mehcached_get_partition_id(state, key_hash));
-                        }
-#else
-                        partition_id = mehcached_get_partition_id(state, key_hash);
-#endif
-                        struct mehcached_table *partition = state->partitions[partition_id];
+                        struct mehcached_table *partition = state->partition;
                         mehcached_prefetch_table(partition, key_hash, &prefetch_state[stage1_index][request_index]);
                     }
-#ifdef USE_HOT_ITEMS
-                    else
-                        partition_ids[stage1_index] = 0;  // any partition can handle no-op requests
-#endif
                 }
 #endif
 #ifndef USE_STAGE_GAP
@@ -556,14 +507,6 @@ mehcached_benchmark_server_proc(void *arg)
             {
                 struct rte_mbuf *mbuf = packet_mbufs[stage3_index];
                 struct mehcached_batch_packet *packet = packets[stage3_index];
-#ifdef NETBENCH_SERVER_MEHCACHED
-#ifdef USE_HOT_ITEMS
-                uint16_t partition_id = partition_ids[stage3_index];
-#else
-                struct mehcached_request *req = (struct mehcached_request *)packet->data + 0;
-                uint16_t partition_id = mehcached_get_partition_id(state, req->key_hash);
-#endif
-#endif
 
                 // ETHER_MAX_LEN/ETHER_CRC_LEN were renamed RTE_ETHER_MAX_LEN/RTE_ETHER_CRC_LEN
                 uint8_t new_key_values[RTE_ETHER_MAX_LEN - RTE_ETHER_CRC_LEN - sizeof(struct mehcached_batch_packet)];
@@ -578,27 +521,18 @@ mehcached_benchmark_server_proc(void *arg)
 #endif
 
 #ifdef NETBENCH_SERVER_MEHCACHED
-                struct mehcached_table *partition = state->partitions[partition_id];
+                struct mehcached_table *partition = state->partition;
                 //struct mehcached_request *requests = (struct mehcached_request *)packet->data;
 
-                uint8_t alloc_id;
-                if (partition_id < state->server_conf->num_partitions)
-                    // alloc_id = (uint8_t)((MEHCACHED_CONCURRENT_TABLE_WRITE(state->server_conf, partition_id) && !MEHCACHED_CONCURRENT_ALLOC_WRITE(state->server_conf, partition_id)) ? (rte_lcore_id() >> 1) : 0);
-                    alloc_id = (uint8_t)((MEHCACHED_CONCURRENT_TABLE_WRITE(state->server_conf, partition_id) && !MEHCACHED_CONCURRENT_ALLOC_WRITE(state->server_conf, partition_id)) ? rte_lcore_id() : 0);
-                else
-                    alloc_id = 0;
+                uint8_t alloc_id = (uint8_t)((MEHCACHED_CONCURRENT_TABLE_WRITE(state->server_conf) && !MEHCACHED_CONCURRENT_ALLOC_WRITE(state->server_conf)) ? rte_lcore_id() : 0);
 
                 bool readonly;
-                if (thread_id == state->server_conf->partitions[partition_id].thread_id)
+                if (thread_id == state->server_conf->partition.thread_id)
                     readonly = false;
-                else if (MEHCACHED_CONCURRENT_TABLE_WRITE(state->server_conf, partition_id))
+                else if (MEHCACHED_CONCURRENT_TABLE_WRITE(state->server_conf))
                     readonly = false;
                 else
                     readonly = true;
-
-#ifdef MEHCACHED_COLLECT_PER_PARTITION_LOAD
-                state->num_per_partition_ops[partition_id] += packet->num_requests;
-#endif
 
                 //mehcached_process_batch(alloc_id, partition, requests, packet->num_requests, packet->data + sizeof(struct mehcached_request) * (size_t)packet->num_requests, new_key_values, &new_key_value_length, readonly);
 #endif
@@ -638,11 +572,8 @@ mehcached_benchmark_server_proc(void *arg)
                                     if ((v & 0xffffffff) != ((~v >> 32) & 0xffffffff))
                                     {
                                         static unsigned int p = 0;
-#ifndef NETBENCH_SERVER_MEHCACHED
-                                        uint16_t partition_id = 0;
-#endif
                                         if ((p++ & 63) == 0)
-                                            fprintf(stderr, "thread %hhu partition %hu unexpected value being written: %lu %lu\n", thread_id, partition_id, (v & 0xffffffff), ((~v >> 32) & 0xffffffff));
+                                            fprintf(stderr, "thread %hhu unexpected value being written: %lu %lu\n", thread_id, (v & 0xffffffff), ((~v >> 32) & 0xffffffff));
                                     }
                                 }
 #ifdef NETBENCH_SERVER_MEHCACHED
@@ -689,11 +620,8 @@ mehcached_benchmark_server_proc(void *arg)
                                         if ((v & 0xffffffff) != ((~v >> 32) & 0xffffffff))
                                         {
                                             static unsigned int p = 0;
-    #ifndef NETBENCH_SERVER_MEHCACHED
-                                            uint16_t partition_id = 0;
-    #endif
                                             if ((p++ & 63) == 0)
-                                                fprintf(stderr, "thread %hhu partition %hu unexpected value being read: %lu %lu\n", thread_id, partition_id, (v & 0xffffffff), ((~v >> 32) & 0xffffffff));
+                                                fprintf(stderr, "thread %hhu unexpected value being read: %lu %lu\n", thread_id, (v & 0xffffffff), ((~v >> 32) & 0xffffffff));
                                         }
                                     }
                                 }
@@ -918,35 +846,8 @@ mehcached_benchmark_server_proc(void *arg)
                         }
                     }
 
-#ifdef MEHCACHED_COLLECT_PER_PARTITION_LOAD
-                    // calculate per-partition load
-                    printf("; load");
-                    uint64_t total_num_per_partition_ops[server_conf->num_partitions];
-                    memset(total_num_per_partition_ops, 0, sizeof(total_num_per_partition_ops));
-                    uint64_t max_ops = 1;
-
-                    size_t partition_id;
-                    for (thread_id = 0; thread_id < ((uint8_t)rte_lcore_count()); thread_id++)
-                    {
-                        for (partition_id = 0; partition_id < server_conf->num_partitions; partition_id++)
-                        {
-                            uint64_t num_per_partition_ops = states[thread_id]->num_per_partition_ops[partition_id];
-                            uint64_t new_num_per_partition_ops = num_per_partition_ops - states[thread_id]->last_num_per_partition_ops[partition_id];
-                            states[thread_id]->last_num_per_partition_ops[partition_id] = num_per_partition_ops;
-                            total_num_per_partition_ops[partition_id] += new_num_per_partition_ops;
-                        }
-                    }
-                    for (partition_id = 0; partition_id < server_conf->num_partitions; partition_id++)
-                        if (max_ops < total_num_per_partition_ops[partition_id])
-                            max_ops = total_num_per_partition_ops[partition_id];
-                    for (partition_id = 0; partition_id < server_conf->num_partitions; partition_id++)
-                        printf(" %zu[%.3f]", partition_id, (double)total_num_per_partition_ops[partition_id] / (double)max_ops);
-#endif
-
 #ifdef MEHCACHED_COLLECT_STATS
-                    uint16_t partition_id;
-                    for (partition_id = 0; partition_id < server_conf->num_partitions + ((uint8_t)rte_lcore_count()); partition_id++)
-                        mehcached_print_stats(state->partitions[partition_id]);
+                    mehcached_print_stats(state->partition);
 #endif
 
                     printf("\n");
@@ -1145,11 +1046,7 @@ mehcached_diagnosis(struct mehcached_server_conf *server_conf)
                     uint8_t request_index;
                     for (request_index = 0; request_index < packet->num_requests; request_index++)
                     {
-                        struct mehcached_request *req = (struct mehcached_request *)packet->data + request_index;
-
-                        uint64_t key_hash = req->key_hash;
-                        uint16_t partition_id = (uint16_t)(key_hash >> 48) & (uint16_t)(server_conf->num_partitions - 1);
-                        uint8_t expected_thread_id = server_conf->partitions[partition_id].thread_id;
+                        uint8_t expected_thread_id = server_conf->partition.thread_id;
 
                         correct_queue = thread_id == expected_thread_id;
 
@@ -1257,8 +1154,7 @@ mehcached_benchmark_prepopulate_proc(void *arg)
         }
 
         uint64_t key_hash = mehcached_hash_key(key_index);
-        uint16_t partition_id = mehcached_get_partition_id(state, key_hash);
-        uint8_t owner_thread_id = server_conf->partitions[partition_id].thread_id;
+        uint8_t owner_thread_id = server_conf->partition.thread_id;
 
         // if (owner_thread_id != thread_id)
         //     continue;
@@ -1292,12 +1188,8 @@ mehcached_benchmark_prepopulate_proc(void *arg)
         *(uint64_t *)value = (key_index & 0xffffffff) | ((~key_index & 0xffffffff) << 32);
 
 #ifdef NETBENCH_SERVER_MEHCACHED
-        struct mehcached_table *partition = state->partitions[partition_id];
-        uint8_t alloc_id;
-        if (partition_id < server_conf->num_partitions)
-            alloc_id = (uint8_t)((MEHCACHED_CONCURRENT_TABLE_WRITE(server_conf, partition_id) && !MEHCACHED_CONCURRENT_ALLOC_WRITE(server_conf, partition_id)) ? thread_id : 0);
-        else
-            alloc_id = 0;
+        struct mehcached_table *partition = state->partition;
+        uint8_t alloc_id = (uint8_t)((MEHCACHED_CONCURRENT_TABLE_WRITE(server_conf) && !MEHCACHED_CONCURRENT_ALLOC_WRITE(server_conf)) ? thread_id : 0);
         uint32_t expire_time = 0;
         bool overwrite = false;
         if (mehcached_set(alloc_id, partition, key_hash, (const uint8_t *)key, key_length, (const uint8_t *)value, prepopulation_conf->value_length, expire_time, overwrite))
@@ -1408,11 +1300,7 @@ mehcached_benchmark_server(const char *machine_filename, const char *server_name
 
     printf("configuring mappings\n");
 
-    uint16_t partition_id;
     uint8_t thread_id;
-#ifdef USE_HOT_ITEMS
-    uint8_t hot_item_id;
-#endif
 
     for (port_id = 0; port_id < server_conf->num_ports; port_id++)
     {
@@ -1420,32 +1308,21 @@ mehcached_benchmark_server(const char *machine_filename, const char *server_name
             return;
     }
 
-    for (partition_id = 0; partition_id < server_conf->num_partitions; partition_id++)
-    {
-        server_conf->partitions[partition_id].thread_id %= (uint8_t)(((uint8_t)rte_lcore_count()) >> cpu_mode);
-        uint8_t thread_id = server_conf->partitions[partition_id].thread_id;
-        for (port_id = 0; port_id < server_conf->num_ports; port_id++)
-            if (!mehcached_set_dst_port_mapping(port_id, (uint16_t)partition_id, thread_id % (uint8_t)(((uint8_t)rte_lcore_count()) >> cpu_mode)))
-                return;
-    }
+    // a single instance serves exactly one partition -- its exclusive-routing mapping_id is always 0
+    server_conf->partition.thread_id %= (uint8_t)(((uint8_t)rte_lcore_count()) >> cpu_mode);
+    for (port_id = 0; port_id < server_conf->num_ports; port_id++)
+        if (!mehcached_set_dst_port_mapping(port_id, 0, server_conf->partition.thread_id % (uint8_t)(((uint8_t)rte_lcore_count()) >> cpu_mode)))
+            return;
 
+    // per-thread mapping_id (1024+thread_id) lets a sender explicitly target a specific thread,
+    // for spreading reads/writes across threads when the partition's concurrency mode allows it
+    // (CREW/CRCW) -- unrelated to how many partitions exist, so this stays as-is.
     for (thread_id = 0; thread_id < ((uint8_t)rte_lcore_count()); thread_id++)
     {
         for (port_id = 0; port_id < server_conf->num_ports; port_id++)
             if (!mehcached_set_dst_port_mapping(port_id, (uint16_t)(1024 + thread_id), thread_id % (uint8_t)(((uint8_t)rte_lcore_count()) >> cpu_mode)))
                 return;
     }
-
-#ifdef USE_HOT_ITEMS
-    for (hot_item_id = 0; hot_item_id < server_conf->num_hot_items; hot_item_id++)
-    {
-        server_conf->hot_items[hot_item_id].thread_id %= (uint8_t)(((uint8_t)rte_lcore_count()) >> cpu_mode);
-        uint8_t thread_id = server_conf->hot_items[hot_item_id].thread_id;
-        for (port_id = 0; port_id < server_conf->num_ports; port_id++)
-            if (!mehcached_set_dst_port_mapping(port_id, (uint16_t)(2048 + hot_item_id), thread_id))
-                return;
-    }
-#endif
 
 
     printf("cleaning up pending packets\n");
@@ -1464,9 +1341,6 @@ mehcached_benchmark_server(const char *machine_filename, const char *server_name
     size_t mem_start = mehcached_get_memuse();
 
     struct server_state *states[((uint8_t)rte_lcore_count())];
-#ifdef NETBENCH_SERVER_MEHCACHED
-    struct mehcached_table *partitions[server_conf->num_partitions + ((uint8_t)rte_lcore_count())];
-#endif
 
     for (thread_id = 0; thread_id < ((uint8_t)rte_lcore_count()); thread_id++)
     {
@@ -1476,9 +1350,6 @@ mehcached_benchmark_server(const char *machine_filename, const char *server_name
 
         state->server_conf = server_conf;
         state->prepopulation_conf = prepopulation_conf;
-#ifdef NETBENCH_SERVER_MEHCACHED
-        state->partitions = partitions;
-#endif
 
         state->target_request_rate = 20000000;  // 20 Mops
 
@@ -1504,15 +1375,15 @@ mehcached_benchmark_server(const char *machine_filename, const char *server_name
     }
 
 #ifdef NETBENCH_SERVER_MEHCACHED
-    for (partition_id = 0; partition_id < server_conf->num_partitions; partition_id++)
+    // a single instance serves exactly one partition -- see mehcached_server_conf.partition
+    struct mehcached_table *partition;
     {
-        uint8_t thread_id = server_conf->partitions[partition_id].thread_id;
+        uint8_t thread_id = server_conf->partition.thread_id;
 
-        //uint8_t num_allocs = (uint8_t)((MEHCACHED_CONCURRENT_TABLE_WRITE(server_conf, partition_id) && !MEHCACHED_CONCURRENT_ALLOC_WRITE(server_conf, partition_id)) ? (((uint8_t)rte_lcore_count()) >> 1) : 1);
-        uint8_t num_allocs = (uint8_t)((MEHCACHED_CONCURRENT_TABLE_WRITE(server_conf, partition_id) && !MEHCACHED_CONCURRENT_ALLOC_WRITE(server_conf, partition_id)) ? ((uint8_t)rte_lcore_count()) : 1);
-        uint64_t num_items = server_conf->partitions[partition_id].num_items;
-        uint64_t alloc_size = server_conf->partitions[partition_id].alloc_size;
-        double mth_threshold = server_conf->partitions[partition_id].mth_threshold;
+        uint8_t num_allocs = (uint8_t)((MEHCACHED_CONCURRENT_TABLE_WRITE(server_conf) && !MEHCACHED_CONCURRENT_ALLOC_WRITE(server_conf)) ? ((uint8_t)rte_lcore_count()) : 1);
+        uint64_t num_items = server_conf->partition.num_items;
+        uint64_t alloc_size = server_conf->partition.alloc_size;
+        double mth_threshold = server_conf->partition.mth_threshold;
 
         // consider per-item overhead
         size_t alloc_overhead = sizeof(struct mehcached_item);
@@ -1532,7 +1403,7 @@ mehcached_benchmark_server(const char *machine_filename, const char *server_name
         num_items = num_items * 12 / 10;
         alloc_size = alloc_size * 12 / 10;
 
-        partitions[partition_id] = mehcached_shm_malloc_contiguous(sizeof(struct mehcached_table), thread_id);
+        partition = mehcached_shm_malloc_contiguous(sizeof(struct mehcached_table), thread_id);
 
         size_t table_numa_node = rte_lcore_to_socket_id((unsigned int)thread_id);
         size_t alloc_numa_nodes[num_allocs];
@@ -1540,10 +1411,10 @@ mehcached_benchmark_server(const char *machine_filename, const char *server_name
         for (alloc_id = 0; alloc_id < num_allocs; alloc_id++)
             alloc_numa_nodes[alloc_id] = table_numa_node;
 
-        bool concurrent_table_read = MEHCACHED_CONCURRENT_TABLE_READ(server_conf, partition_id);
-        bool concurrent_table_write = MEHCACHED_CONCURRENT_TABLE_WRITE(server_conf, partition_id);
-        bool concurrent_alloc_write = MEHCACHED_CONCURRENT_ALLOC_WRITE(server_conf, partition_id);
-        mehcached_table_init(partitions[partition_id],
+        bool concurrent_table_read = MEHCACHED_CONCURRENT_TABLE_READ(server_conf);
+        bool concurrent_table_write = MEHCACHED_CONCURRENT_TABLE_WRITE(server_conf);
+        bool concurrent_alloc_write = MEHCACHED_CONCURRENT_ALLOC_WRITE(server_conf);
+        mehcached_table_init(partition,
             (num_items + MEHCACHED_ITEMS_PER_BUCKET - 1) / MEHCACHED_ITEMS_PER_BUCKET,
             num_allocs,
             alloc_size,
@@ -1552,43 +1423,12 @@ mehcached_benchmark_server(const char *machine_filename, const char *server_name
             mth_threshold);
     }
     for (thread_id = 0; thread_id < ((uint8_t)rte_lcore_count()); thread_id++)
-    {
-        uint16_t partition_id = (uint16_t)(server_conf->num_partitions + thread_id);
-
-        uint8_t num_allocs = 1;
-        uint64_t num_items = 256;
-        uint64_t alloc_size = 2048576;
-
-        partitions[partition_id] = mehcached_shm_malloc_contiguous(sizeof(struct mehcached_table), thread_id);
-
-        size_t table_numa_node = rte_lcore_to_socket_id((unsigned int)thread_id);
-        size_t alloc_numa_nodes[num_allocs];
-        uint8_t alloc_id;
-        for (alloc_id = 0; alloc_id < num_allocs; alloc_id++)
-            alloc_numa_nodes[alloc_id] = table_numa_node;
-
-        // CREW for hot items
-        bool concurrent_table_read = true;
-        bool concurrent_table_write = false;
-        bool concurrent_alloc_write = false;
-        mehcached_table_init(partitions[partition_id],
-            (num_items + MEHCACHED_ITEMS_PER_BUCKET - 1) / MEHCACHED_ITEMS_PER_BUCKET,
-            num_allocs,
-            alloc_size,
-            concurrent_table_read, concurrent_table_write, concurrent_alloc_write,
-            table_numa_node, alloc_numa_nodes,
-            MEHCACHED_MTH_THRESHOLD_FIFO);
-    }
+        states[thread_id]->partition = partition;
 #endif
 #ifdef NETBENCH_SERVER_MEMCACHED
     {
-        uint64_t total_num_items = 0;
-        uint64_t total_alloc_size = 0;
-        for (partition_id = 0; partition_id < server_conf->num_partitions; partition_id++)
-        {
-            total_num_items += server_conf->partitions[partition_id].num_items;
-            total_alloc_size += server_conf->partitions[partition_id].alloc_size;
-        }
+        uint64_t total_num_items = server_conf->partition.num_items;
+        uint64_t total_alloc_size = server_conf->partition.alloc_size;
 
         // memcached uses quite much more space if the average item size is large
         if (total_alloc_size / total_num_items >= 64)

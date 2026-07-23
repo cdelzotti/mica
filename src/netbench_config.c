@@ -87,33 +87,15 @@ mehcached_get_server_conf(const char *filename, const char *server_name)
 				ret = sscanf(buf, "server_partition,%lu,%lu,%hhu,%hhu,%hhu,%hhu,%lf\n", &num_items, &alloc_size, &concurrent_table_read, &concurrent_table_write, &concurrent_alloc_write, &thread_id, &mth_threshold);
 				if (ret == 7)
 				{
-					conf->partitions[conf->num_partitions].num_items = num_items;
-					conf->partitions[conf->num_partitions].alloc_size = alloc_size;
-					conf->partitions[conf->num_partitions].concurrent_table_read = concurrent_table_read;
-					conf->partitions[conf->num_partitions].concurrent_table_write = concurrent_table_write;
-					conf->partitions[conf->num_partitions].concurrent_alloc_write = concurrent_alloc_write;
-					conf->partitions[conf->num_partitions].thread_id = thread_id;
-					conf->partitions[conf->num_partitions].mth_threshold = mth_threshold;
-					conf->num_partitions++;
-					assert(conf->num_partitions <= MEHCACHED_MAX_PARTITIONS);
-					continue;
-				}
-				else if (ret != 0)
-				{
-					fprintf(stderr, "parse error: %s (in %s)\n", buf, filename);
-					continue;
-				}
-			}
-			{
-				uint64_t key_hash;
-				uint8_t thread_id;
-				ret = sscanf(buf, "server_hot_item,%lx,%hhu\n", &key_hash, &thread_id);
-				if (ret == 2)
-				{
-					conf->hot_items[conf->num_hot_items].key_hash = key_hash;
-					conf->hot_items[conf->num_hot_items].thread_id = thread_id;
-					conf->num_hot_items++;
-					assert(conf->num_hot_items <= MEHCACHED_MAX_HOT_ITEMS);
+					// a single instance serves exactly one partition -- last server_partition
+					// line in the file wins if more than one is (mistakenly) present
+					conf->partition.num_items = num_items;
+					conf->partition.alloc_size = alloc_size;
+					conf->partition.concurrent_table_read = concurrent_table_read;
+					conf->partition.concurrent_table_write = concurrent_table_write;
+					conf->partition.concurrent_alloc_write = concurrent_alloc_write;
+					conf->partition.thread_id = thread_id;
+					conf->partition.mth_threshold = mth_threshold;
 					continue;
 				}
 				else if (ret != 0)

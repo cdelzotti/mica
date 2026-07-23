@@ -19,9 +19,7 @@
 
 //#define MEHCACHED_MAX_PORTS (8)
 #define MEHCACHED_MAX_THREADS (16)
-#define MEHCACHED_MAX_PARTITIONS (64)
-#define MEHCACHED_MAX_HOT_ITEMS (64)
-
+#define MEHCACHED_MAX_PARTITIONS (64)	// still used by microbench.c's own local (non-networked) multi-partition benchmark
 
 // server
 struct mehcached_server_thread_conf
@@ -40,26 +38,20 @@ struct mehcached_server_partition_conf
 	double mth_threshold;
 };
 
-struct mehcached_server_hot_item_conf
-{
-	uint64_t key_hash;
-	uint8_t thread_id;
-};
-
 struct mehcached_server_conf
 {
 	uint8_t num_ports;	// not read from config at all any more -- set from however many ports
 				// DPDK actually reports (see mehcached_init_network()/netbench_server.c)
 	struct mehcached_server_thread_conf threads[MEHCACHED_MAX_THREADS];
-	uint16_t num_partitions;
-	struct mehcached_server_partition_conf partitions[MEHCACHED_MAX_PARTITIONS];
-	uint8_t num_hot_items;
-	struct mehcached_server_hot_item_conf hot_items[MEHCACHED_MAX_HOT_ITEMS];
+	// a single DPDK application instance now serves exactly one partition -- no partition array,
+	// no in-process partition routing. To serve multiple partitions, run one instance per
+	// partition (each on its own port/--file-prefix); see net_common.c/gen_confs.py.
+	struct mehcached_server_partition_conf partition;
 };
 
-#define MEHCACHED_CONCURRENT_TABLE_READ(server_conf, partition_id) ((server_conf)->partitions[partition_id].concurrent_table_read)
-#define MEHCACHED_CONCURRENT_TABLE_WRITE(server_conf, partition_id) ((server_conf)->partitions[partition_id].concurrent_table_write)
-#define MEHCACHED_CONCURRENT_ALLOC_WRITE(server_conf, partition_id) ((server_conf)->partitions[partition_id].concurrent_alloc_write)
+#define MEHCACHED_CONCURRENT_TABLE_READ(server_conf) ((server_conf)->partition.concurrent_table_read)
+#define MEHCACHED_CONCURRENT_TABLE_WRITE(server_conf) ((server_conf)->partition.concurrent_table_write)
+#define MEHCACHED_CONCURRENT_ALLOC_WRITE(server_conf) ((server_conf)->partition.concurrent_alloc_write)
 
 
 // prepopulation
