@@ -196,7 +196,7 @@ mehcached_eal_malloc_lcore(size_t size, size_t lcore)
         mehcached_eal_malloc_lcore_internal(&malloc_arg);
     else
     {
-        assert(rte_lcore_id() == rte_get_master_lcore());
+        assert(rte_lcore_id() == rte_get_main_lcore());	// rte_get_master_lcore() was renamed rte_get_main_lcore()
         rte_eal_remote_launch(mehcached_eal_malloc_lcore_internal, &malloc_arg, (unsigned int)lcore);
         rte_eal_mp_wait_lcore();
     }

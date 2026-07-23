@@ -17,7 +17,17 @@
 #include <stdint.h>
 #include <unistd.h>
 
-typedef int bool;
-#define true (1)
-#define false (0)
+// This used to be a hand-rolled `typedef int bool;` (2014-era, predating widespread <stdbool.h>
+// use). Modern DPDK's own public headers (e.g. rte_stdatomic.h) now pull in <stdbool.h> transitively,
+// which -- once the codebase links against a modern DPDK -- redefines the `bool` token as the builtin
+// _Bool partway through translation units that include a DPDK header after this one. Because the old
+// typedef and <stdbool.h>'s macro don't agree (int vs _Bool), any function whose prototype was parsed
+// before that point and definition after (or vice versa) ends up with "conflicting types" errors.
+// Using <stdbool.h> directly instead makes MICA's own `bool` and DPDK's `bool` the exact same
+// definition everywhere, which removes the conflict. This is safe: no on-wire/packed struct in this
+// codebase uses `bool` as a field type (they all use explicit-width types like uint8_t), so nothing
+// depends on the old sizeof(bool) == sizeof(int).
+#ifndef __cplusplus
+#include <stdbool.h>
+#endif
 

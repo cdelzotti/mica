@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-cmake_minimum_required(VERSION 2.6)
+cmake_minimum_required(VERSION 3.6)
 
 # basic configuration
 if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_CURRENT_BINARY_DIR)
@@ -61,13 +61,13 @@ set(LIBRARIES ${LIBRARIES} rt crypto perf_count m pthread)
 #set(LIBRARIES ${LIBRARIES} tcmalloc_minimal)
 
 # DPDK
-set(RTE_SDK ${CMAKE_CURRENT_SOURCE_DIR}/../../DPDK)
-set(RTE_TARGET x86_64-default-linuxapp-gcc)
+# DPDK is discovered via pkg-config's "libdpdk" module (as installed by modern
+# DPDK's meson/ninja build), instead of pointing at a hand-built RTE_SDK/RTE_TARGET
+# tree and linking a fixed list of .a files.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBDPDK REQUIRED IMPORTED_TARGET libdpdk)
 add_definitions(-DUSE_DPDK)
-add_definitions(-isystem ${RTE_SDK}/${RTE_TARGET}/include -include rte_config.h)
-link_directories(${LINK_DIRECTORIES} ${RTE_SDK}/${RTE_TARGET}/lib)
-set(LIBRARIES ${LIBRARIES} rte_eal rte_malloc rte_mempool rte_ring)	# for basic features
-set(LIBRARIES ${LIBRARIES} ethdev rte_mbuf rte_pmd_ixgbe librte_pmd_ring.a)	# for network features
+set(LIBRARIES ${LIBRARIES} PkgConfig::LIBDPDK)
 set(LIBRARIES ${LIBRARIES} pthread rt)	# to make sure symbols in pthread and rt are resolved
 
 if(NOT "${NLOCAL}" STREQUAL "yes")

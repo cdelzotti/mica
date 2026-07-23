@@ -24,10 +24,13 @@
 #include <rte_lcore.h>
 #include <rte_byteorder.h>
 #include <rte_ethdev.h>
+#include <rte_flow.h>
 #include <rte_log.h>
 #include <rte_debug.h>
 
-#define MEHCACHED_MBUF_ENTRY_SIZE (2048 + sizeof(struct rte_mbuf) + RTE_PKTMBUF_HEADROOM)
+// data room size of each mbuf's packet buffer (excludes struct rte_mbuf itself and its private area,
+// which rte_pktmbuf_pool_create() now accounts for on its own -- see mehcached_init_network())
+#define MEHCACHED_MBUF_DATA_ROOM_SIZE (2048 + RTE_PKTMBUF_HEADROOM)
 #define MEHCACHED_MBUF_SIZE (MEHCACHED_MAX_PORTS * MEHCACHED_MAX_QUEUES * 4096)     // TODO: need to divide by numa node count
 
 #define MEHCACHED_MAX_PKT_BURST (32)
@@ -48,32 +51,23 @@ static uint16_t mehcached_num_tx_desc = RTE_TEST_TX_DESC_DEFAULT;
 //#define MEHCACHED_USE_QUICK_SLEEP
 //#define MEHCACHED_USE_DEEP_SLEEP
 
+// NOTE: struct rte_eth_conf lost most of its .rxmode bitfields (header_split, hw_ip_checksum,
+// hw_vlan_filter, jumbo_frame, hw_strip_crc, ...) somewhere around the DPDK 17-18 offload API
+// rework. They are now opt-in flags in .rxmode.offloads (RTE_ETH_RX_OFFLOAD_*) / .txmode.offloads
+// (RTE_ETH_TX_OFFLOAD_*), validated against what the device advertises in struct rte_eth_dev_info.
+// Since this table only ever disabled everything, leaving .offloads at 0 (its zero-init default)
+// reproduces the old behavior exactly, so there was nothing left to port for rxmode/txmode here.
+//
+// .fdir_conf, however, is gone completely: legacy Flow Director (rte_eth_dev_fdir_*, rte_fdir_filter,
+// rte_fdir_masks) was replaced project-wide by the generic rte_flow API. There is no struct field to
+// configure up front any more -- seem mehcached_set_dst_port_mask()/mehcached_set_dst_port_mapping()
+// below, which is where the real complexity of this migration lives.
 static const struct rte_eth_conf mehcached_port_conf = {
 	.rxmode = {
-        .max_rx_pkt_len = ETHER_MAX_LEN,
-		.split_hdr_size = 0,
-		.header_split   = 0, /**< Header Split disabled */
-		.hw_ip_checksum = 0, /**< IP checksum offload disabled */
-		.hw_vlan_filter = 0, /**< VLAN filtering disabled */
-		.jumbo_frame    = 0, /**< Jumbo Frame Support disabled */
-		.hw_strip_crc   = 0, /**< CRC stripped by hardware */
-		.mq_mode = ETH_MQ_RX_NONE,
+		.mq_mode = RTE_ETH_MQ_RX_NONE,
 	},
 	.txmode = {
-		.mq_mode = ETH_MQ_TX_NONE,
-	},
-	.fdir_conf = {
-		//.mode =             RTE_FDIR_MODE_NONE,
-		.mode =             RTE_FDIR_MODE_PERFECT,
-		.pballoc =          RTE_FDIR_PBALLOC_64K,
-		//.pballoc =          RTE_FDIR_PBALLOC_256K,
-#ifndef NDEBUG
-		.status =           RTE_FDIR_NO_REPORT_STATUS,
-#else
-		.status =           RTE_FDIR_REPORT_STATUS_ALWAYS,
-#endif
-		.flexbytes_offset = 0,
-		.drop_queue =       0,
+		.mq_mode = RTE_ETH_MQ_TX_NONE,
 	},
 };
 
@@ -83,25 +77,18 @@ static const struct rte_eth_rxconf mehcached_rx_conf = {
 		.hthresh = MEHCACHED_RX_HTHRESH,
 		.wthresh = MEHCACHED_RX_WTHRESH,
 	},
-	.rx_free_thresh = 32,	// for DPDK >= 1.3
+	.rx_free_thresh = 32,
 	.rx_drop_en = 0,		// (does not seem to be used)
 };
 
-static const struct rte_eth_txconf mehcached_tx_conf = {
-	.tx_thresh = {
-		.pthresh = MEHCACHED_TX_PTHRESH,
-		.hthresh = MEHCACHED_TX_HTHRESH,
-		.wthresh = MEHCACHED_TX_WTHRESH,
-	},
-	.tx_free_thresh = 0, /* Use PMD default values */
-	.tx_rs_thresh = 0, /* Use PMD default values */
-#ifndef MEHCACHED_USE_SOFT_FDIR
-    .txq_flags = (ETH_TXQ_FLAGS_NOMULTSEGS | ETH_TXQ_FLAGS_NOREFCOUNT | ETH_TXQ_FLAGS_NOMULTMEMP | ETH_TXQ_FLAGS_NOOFFLOADS),
-#else
-    .txq_flags = (ETH_TXQ_FLAGS_NOMULTSEGS | ETH_TXQ_FLAGS_NOREFCOUNT | ETH_TXQ_FLAGS_NOOFFLOADS),
-#endif
-};
-
+// NOTE: .txq_flags (ETH_TXQ_FLAGS_NOMULTSEGS | ETH_TXQ_FLAGS_NOREFCOUNT | ...) was removed from
+// struct rte_eth_txconf along with the rest of the old offload bitfields; the closest surviving
+// equivalent is the RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE offload (roughly: "no refcount, no multi-seg,
+// safe to free mbufs the fast way"), and it must be checked against the port's dev_info.tx_offload_capa
+// before being requested. Because of that per-port capability check, mehcached_tx_conf can no longer
+// be a single file-scope constant: it is now built per port inside mehcached_init_network(), seeded
+// from the port's own dev_info.default_txconf (itself a new concept -- previously the whole txconf
+// was supplied by the application) with only the thresholds and offloads overridden.
 
 struct mehcached_queue_state {
 	struct rte_mbuf *rx_mbufs[MEHCACHED_MAX_PKT_BURST];
@@ -135,6 +122,10 @@ static struct rte_mempool *mehcached_pktmbuf_pool[MEHCACHED_MAX_NUMA_NODES];
 //static struct ether_addr mehcached_eth_addr[MEHCACHED_MAX_PORTS];
 
 static struct mehcached_queue_state *mehcached_queue_states[MEHCACHED_MAX_QUEUES * MEHCACHED_MAX_PORTS];
+
+// exact-match dst-port mask recorded by mehcached_set_dst_port_mask() and consumed by every
+// subsequent mehcached_set_dst_port_mapping() call -- see the comment above mehcached_set_dst_port_mask().
+static uint16_t mehcached_dst_port_mask = 0;
 
 struct rte_mbuf *
 mehcached_packet_alloc()
@@ -378,9 +369,16 @@ mehcached_init_network(uint64_t cpu_mask, uint64_t port_mask, uint8_t *out_num_p
 		char pool_name[64];
 		snprintf(pool_name, sizeof(pool_name), "pktmbuf_pool%zu", i);
 		// if this is not big enough, RX/TX performance may not be consistent, e.g., between CREW and CRCW experiments
-		// the maximum cache size can be adjusted in DPDK's .config file: CONFIG_RTE_MEMPOOL_CACHE_MAX_SIZE
+		// the mempool's per-core cache size ceiling used to be a hand-patched DPDK ./config knob
+		// (CONFIG_RTE_MEMPOOL_CACHE_MAX_SIZE, see scripts/setup_dkdp_env.sh); on a meson-built DPDK
+		// it is instead a build option (-Dmax_mempool_cache_size) baked into whatever package/tree
+		// your system's libdpdk.pc points at, so that is what to check first if this call starts failing.
 		const unsigned int cache_size = MEHCACHED_MAX_PORTS * 1024;
-		mehcached_pktmbuf_pool[i] = rte_mempool_create(pool_name, MEHCACHED_MBUF_SIZE, MEHCACHED_MBUF_ENTRY_SIZE, cache_size, sizeof(struct rte_pktmbuf_pool_private), rte_pktmbuf_pool_init, NULL, rte_pktmbuf_init, NULL, (int)i, 0);
+		// rte_pktmbuf_pool_create() replaces the old rte_mempool_create() + rte_pktmbuf_pool_init()/
+		// rte_pktmbuf_init() callback trio: it derives the real mempool element size itself
+		// (sizeof(struct rte_mbuf) + priv_size + data_room_size), so we now only pass the packet
+		// data room size instead of the old hand-computed MEHCACHED_MBUF_ENTRY_SIZE.
+		mehcached_pktmbuf_pool[i] = rte_pktmbuf_pool_create(pool_name, MEHCACHED_MBUF_SIZE, cache_size, 0, MEHCACHED_MBUF_DATA_ROOM_SIZE, (int)i);
 		if (mehcached_pktmbuf_pool[i] == NULL)
 		{
 			fprintf(stderr, "failed to allocate mbuf for numa node %zu\n", i);
@@ -388,28 +386,18 @@ mehcached_init_network(uint64_t cpu_mask, uint64_t port_mask, uint8_t *out_num_p
 		}
 	}
 
-	// initialize driver
-#ifdef RTE_LIBRTE_IXGBE_PMD
-	printf("initializing PMD\n");
-	if (rte_ixgbe_pmd_init() < 0)
-	{
-		fprintf(stderr, "failed to initialize ixgbe pmd\n");
-		return false;
-	}
-#endif
-
-	printf("probing PCI\n");
-	if (rte_eal_pci_probe() < 0)
-	{
-		fprintf(stderr, "failed to probe PCI\n");
-		return false;
-	}
-
-	// TODO: initialize and set up timer for forced TX
+	// NOTE: the old "initialize driver" step -- #ifdef RTE_LIBRTE_IXGBE_PMD rte_ixgbe_pmd_init() --
+	// and the rte_eal_pci_probe() call that followed it are both gone. Modern DPDK PMDs self-register
+	// via driver constructors, and rte_eal_init() itself scans and probes every bus (PCI included),
+	// so there is nothing left for the application to trigger here.
 
 	// check port and queue limits
-	uint8_t num_ports = rte_eth_dev_count();
-	assert(num_ports <= MEHCACHED_MAX_PORTS);
+	// rte_eth_dev_count() was removed; rte_eth_dev_count_avail() (or iterating with RTE_ETH_FOREACH_DEV)
+	// is the replacement. It returns uint16_t now, but MEHCACHED_MAX_PORTS is fixed at 8, so keeping
+	// mehcached_init_network()'s public uint8_t port_id/out_num_ports (net_common.h, unchanged) is safe.
+	uint16_t num_ports_avail = rte_eth_dev_count_avail();
+	assert(num_ports_avail <= MEHCACHED_MAX_PORTS);
+	uint8_t num_ports = (uint8_t)num_ports_avail;
 	*out_num_ports = num_ports;
 
 	printf("checking queue limits\n");
@@ -420,7 +408,13 @@ mehcached_init_network(uint64_t cpu_mask, uint64_t port_mask, uint8_t *out_num_p
 			continue;
 
 		struct rte_eth_dev_info dev_info;
-		rte_eth_dev_info_get((uint8_t)port_id, &dev_info);
+		// rte_eth_dev_info_get() used to return void; it now returns an int status that must be checked.
+		ret = rte_eth_dev_info_get(port_id, &dev_info);
+		if (ret != 0)
+		{
+			fprintf(stderr, "failed to get device info for port %hhu (err=%d)\n", port_id, ret);
+			return false;
+		}
 
 		if (num_queues > dev_info.max_tx_queues || num_queues > dev_info.max_rx_queues)
 		{
@@ -458,12 +452,46 @@ mehcached_init_network(uint64_t cpu_mask, uint64_t port_mask, uint8_t *out_num_p
 		// get mac address
 		//rte_eth_macaddr_get((uint8_t)port, &mehcached_eth_addr[port]);
 
-		ret = rte_eth_dev_configure(port_id, num_queues, num_queues, &mehcached_port_conf);
+		struct rte_eth_dev_info dev_info;
+		ret = rte_eth_dev_info_get(port_id, &dev_info);
+		if (ret != 0)
+		{
+			fprintf(stderr, "failed to get device info for port %hhu (err=%d)\n", port_id, ret);
+			return false;
+		}
+
+		// per-port copy: whether RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE can be requested depends on
+		// dev_info, which is itself per port, so mehcached_port_conf can no longer be passed as-is.
+		struct rte_eth_conf port_conf = mehcached_port_conf;
+		if ((dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE) != 0)
+			port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;	// closest modern analogue of the old ETH_TXQ_FLAGS_NOREFCOUNT hint
+
+		ret = rte_eth_dev_configure(port_id, num_queues, num_queues, &port_conf);
 		if (ret < 0)
 		{
 			fprintf(stderr, "failed to configure port %hhu (err=%d)\n", port_id, ret);
 			return false;
 		}
+
+		// new mandatory step: PMDs may require descriptor counts to be rounded up/down or clamped
+		// to device-specific limits; rte_eth_rx/tx_queue_setup() no longer do this silently.
+		uint16_t num_rx_desc = mehcached_num_rx_desc;
+		uint16_t num_tx_desc = mehcached_num_tx_desc;
+		ret = rte_eth_dev_adjust_nb_rx_tx_desc(port_id, &num_rx_desc, &num_tx_desc);
+		if (ret < 0)
+		{
+			fprintf(stderr, "failed to adjust descriptor counts for port %hhu (err=%d)\n", port_id, ret);
+			return false;
+		}
+
+		// see the comment above mehcached_rx_conf/mehcached_tx_conf's old declaration: the tx conf
+		// is now seeded from the device's own default and only the thresholds/offloads we care
+		// about are overridden, instead of being a single hardcoded file-scope constant.
+		struct rte_eth_txconf tx_conf = dev_info.default_txconf;
+		tx_conf.tx_thresh.pthresh = MEHCACHED_TX_PTHRESH;
+		tx_conf.tx_thresh.hthresh = MEHCACHED_TX_HTHRESH;
+		tx_conf.tx_thresh.wthresh = MEHCACHED_TX_WTHRESH;
+		tx_conf.offloads = port_conf.txmode.offloads;
 
 		uint32_t lcore;
 		for (lcore = 0; lcore < rte_lcore_count(); lcore++)
@@ -475,14 +503,14 @@ mehcached_init_network(uint64_t cpu_mask, uint64_t port_mask, uint8_t *out_num_p
 
 			size_t numa_node = rte_lcore_to_socket_id((unsigned int)lcore);
 
-			ret = rte_eth_rx_queue_setup(port_id, queue, (unsigned int)mehcached_num_rx_desc, (unsigned int)numa_node, &mehcached_rx_conf, mehcached_pktmbuf_pool[numa_node]);
+			ret = rte_eth_rx_queue_setup(port_id, queue, num_rx_desc, (unsigned int)numa_node, &mehcached_rx_conf, mehcached_pktmbuf_pool[numa_node]);
 			if (ret < 0)
 			{
 				fprintf(stderr, "failed to configure port %hhu rx_queue %hu (err=%d)\n", port_id, queue, ret);
 				return false;
 			}
 
-			ret = rte_eth_tx_queue_setup(port_id, queue, (unsigned int)mehcached_num_tx_desc, (unsigned int)numa_node, &mehcached_tx_conf);
+			ret = rte_eth_tx_queue_setup(port_id, queue, num_tx_desc, (unsigned int)numa_node, &tx_conf);
 			if (ret < 0)
 			{
 				fprintf(stderr, "failed to configure port %hhu tx_queue %hu (err=%d)\n", port_id, queue, ret);
@@ -516,14 +544,21 @@ mehcached_init_network(uint64_t cpu_mask, uint64_t port_mask, uint8_t *out_num_p
 		fflush(stdout);
 
 		struct rte_eth_link link;
-		rte_eth_link_get(port_id, &link);
+		// rte_eth_link_get() used to return void; it now returns an int status that must be checked.
+		ret = rte_eth_link_get(port_id, &link);
+		if (ret < 0)
+		{
+			fprintf(stderr, "failed to get link status for port %hhu (err=%d)\n", port_id, ret);
+			return false;
+		}
 		if (!link.link_status)
 		{
 			printf("link down\n");
 			return false;
 		}
 
-		printf("%hu Gbps (%s)\n", link.link_speed / 1000, (link.link_duplex == ETH_LINK_FULL_DUPLEX) ? ("full-duplex") : ("half-duplex"));
+		// ETH_LINK_FULL_DUPLEX was renamed RTE_ETH_LINK_FULL_DUPLEX
+		printf("%hu Gbps (%s)\n", link.link_speed / 1000, (link.link_duplex == RTE_ETH_LINK_FULL_DUPLEX) ? ("full-duplex") : ("half-duplex"));
 	}
 
 	memset(mehcached_queue_states, 0, sizeof(mehcached_queue_states));
@@ -542,15 +577,27 @@ void
 mehcached_free_network(uint64_t port_mask)
 {
 	uint8_t port_id;
-	uint8_t num_ports = rte_eth_dev_count();
-	
+	uint8_t num_ports = (uint8_t)rte_eth_dev_count_avail();	// rte_eth_dev_count() was removed; see mehcached_init_network()
+
 	for (port_id = 0; port_id < num_ports; port_id++)
 	{
 		if ((port_mask & ((uint64_t)1 << port_id)) == 0)
 			continue;
 
+		// modern apps are expected to tear down their own rte_flow rules explicitly (see the
+		// mehcached_set_dst_port_mapping() comment) rather than relying on rte_eth_dev_stop()/
+		// _close() to implicitly discard them the way legacy FDIR filters were.
+		struct rte_flow_error flow_error;
+		memset(&flow_error, 0, sizeof(flow_error));
+		if (rte_flow_flush(port_id, &flow_error) != 0)
+			fprintf(stderr, "warning: failed to flush flow rules on port %hhu (%s)\n", port_id, flow_error.message ? flow_error.message : "unknown error");
+
 		printf("stopping port %hhu...\n", port_id);
-		rte_eth_dev_stop(port_id);
+		// rte_eth_dev_stop() used to return void; it now returns an int status. Teardown proceeds
+		// best-effort regardless, so this is logged rather than treated as fatal.
+		int ret = rte_eth_dev_stop(port_id);
+		if (ret != 0)
+			fprintf(stderr, "warning: failed to stop port %hhu (err=%d)\n", port_id, ret);
 	}
 
 	for (port_id = 0; port_id < num_ports; port_id++)
@@ -559,24 +606,49 @@ mehcached_free_network(uint64_t port_mask)
 			continue;
 
 		printf("closing port %hhu...\n", port_id);
-		rte_eth_dev_close(port_id);
+		// rte_eth_dev_close() used to return void; same best-effort logging as rte_eth_dev_stop() above.
+		int ret = rte_eth_dev_close(port_id);
+		if (ret != 0)
+			fprintf(stderr, "warning: failed to close port %hhu (err=%d)\n", port_id, ret);
 	}
 }
+
+// --- Flow Director -> rte_flow migration -------------------------------------------------------
+//
+// This pair of functions is the hardest part of this file to port, because legacy FDIR and rte_flow
+// don't just rename a few symbols -- they model hardware packet steering differently:
+//
+//  * FDIR was configured in two separate steps against implicit, port-wide state: set a single mask
+//    once (rte_eth_dev_fdir_set_masks()), then add any number of filters that were implicitly
+//    matched against that shared mask (rte_eth_dev_fdir_add_perfect_filter()). rte_flow has no
+//    port-wide state at all: every rule is a self-contained (pattern, mask, actions) tuple passed to
+//    a single rte_flow_create() call. There is no "set the mask" primitive to call into any more --
+//    mehcached_set_dst_port_mask() below just remembers the value for the next
+//    mehcached_set_dst_port_mapping() call to embed into its own rule.
+//
+//  * FDIR's struct rte_fdir_filter was flat: one struct carried iptype + l4type + the UDP dst port to
+//    match. rte_flow instead requires an explicit, layered *pattern* from L2 up (ETH, then IPV4, then
+//    UDP, then an END marker) -- there is no "just match UDP dst port, whatever the packet is wrapped
+//    in" shortcut. The ETH/IPV4 items below are left wildcarded (NULL spec/mask) purely to select
+//    "IPv4-over-Ethernet", mirroring FDIR's old iptype = RTE_FDIR_IPTYPE_IPV4.
+//
+//  * FDIR identified a filter by an application-chosen "soft_id" you could use to look it up or
+//    delete it later. rte_flow instead returns an opaque struct rte_flow* handle from
+//    rte_flow_create() that IS the rule's identity; there is no soft_id/lookup-by-value concept.
+//    MICA never reused soft_id for anything beyond bookkeeping, so this is a non-issue functionally,
+//    but it does mean there is nowhere to stash per-rule handles if this code ever needs to remove
+//    individual rules later (mehcached_free_network() above only supports flushing everything on a
+//    port at once, via rte_flow_flush()).
+//
+//  * Not every PMD/NIC implements rte_flow UDP-dst-port -> queue steering, so, unlike the old direct
+//    ioctl-style FDIR calls, it's worth validating the rule with rte_flow_validate() before actually
+//    creating it, to get a clearer error message when the hardware can't do this.
 
 bool
 mehcached_set_dst_port_mask(uint8_t port_id, uint16_t l4_dst_port_mask)
 {
-	struct rte_fdir_masks mask;
-	memset(&mask, 0, sizeof(mask));
-	mask.dst_port_mask = l4_dst_port_mask;	// this must be little-endian (host)
-
-	int ret = rte_eth_dev_fdir_set_masks(port_id, &mask);
-	if (ret < 0)
-	{
-		fprintf(stderr, "failed to set perfect filter mask on port %hhu (err=%d)\n", port_id, ret);
-		return false;
-	}
-
+	(void)port_id;	// no per-port DPDK call any more -- see the migration note above
+	mehcached_dst_port_mask = l4_dst_port_mask;
 	return true;
 }
 
@@ -591,17 +663,44 @@ mehcached_set_dst_port_mapping(uint8_t port_id, uint16_t l4_dst_port, uint32_t l
 	// }
 	uint16_t queue = (uint16_t)lcore;
 
-	struct rte_fdir_filter filter;
-	memset(&filter, 0, sizeof(filter));
-	filter.iptype = RTE_FDIR_IPTYPE_IPV4;
-	filter.l4type = RTE_FDIR_L4TYPE_UDP;
-	filter.port_dst = rte_cpu_to_be_16((uint16_t)l4_dst_port);    // this must be big-endian
-    uint16_t soft_id = (uint16_t)l4_dst_port;	// will be unique on each port (with perfect filter)
+	struct rte_flow_item_udp udp_spec;
+	memset(&udp_spec, 0, sizeof(udp_spec));
+	udp_spec.hdr.dst_port = rte_cpu_to_be_16(l4_dst_port);	// this must be big-endian, same as the old filter.port_dst
 
-	int ret = rte_eth_dev_fdir_add_perfect_filter(port_id, &filter, soft_id, (uint8_t)queue, 0);
-	if (ret < 0)
+	struct rte_flow_item_udp udp_mask;
+	memset(&udp_mask, 0, sizeof(udp_mask));
+	udp_mask.hdr.dst_port = rte_cpu_to_be_16(mehcached_dst_port_mask);
+
+	struct rte_flow_item pattern[] = {
+		{ .type = RTE_FLOW_ITEM_TYPE_ETH },	// wildcard: just says "there is an Ethernet header here"
+		{ .type = RTE_FLOW_ITEM_TYPE_IPV4 },	// wildcard: "...carrying IPv4" (replaces filter.iptype)
+		{ .type = RTE_FLOW_ITEM_TYPE_UDP, .spec = &udp_spec, .mask = &udp_mask },	// replaces filter.l4type + filter.port_dst
+		{ .type = RTE_FLOW_ITEM_TYPE_END },
+	};
+
+	struct rte_flow_action_queue queue_action = { .index = queue };	// replaces the (uint8_t)queue argument to rte_eth_dev_fdir_add_perfect_filter()
+	struct rte_flow_action actions[] = {
+		{ .type = RTE_FLOW_ACTION_TYPE_QUEUE, .conf = &queue_action },
+		{ .type = RTE_FLOW_ACTION_TYPE_END },
+	};
+
+	struct rte_flow_attr attr;
+	memset(&attr, 0, sizeof(attr));
+	attr.ingress = 1;
+
+	struct rte_flow_error error;
+	memset(&error, 0, sizeof(error));
+
+	if (rte_flow_validate(port_id, &attr, pattern, actions, &error) != 0)
 	{
-		fprintf(stderr, "failed to add perfect filter entry on port %hhu (err=%d)\n", port_id, ret);
+		fprintf(stderr, "failed to add perfect filter entry on port %hhu (rule not supported: %s)\n", port_id, error.message ? error.message : "unknown error");
+		return false;
+	}
+
+	struct rte_flow *flow = rte_flow_create(port_id, &attr, pattern, actions, &error);
+	if (flow == NULL)
+	{
+		fprintf(stderr, "failed to add perfect filter entry on port %hhu (%s)\n", port_id, error.message ? error.message : "unknown error");
 		return false;
 	}
 
