@@ -27,7 +27,7 @@ Adapted from the Initial MICA paper, this aim to modernize the 2014 codebase wit
 ### Build steps
 
 ```sh
-cmake -Bbuild
+cmake -Bbuild .
 cd build
 make
 ```
@@ -108,6 +108,48 @@ keys (e.g. to issue `GET`s against a warmed-up table instead of only `SET`s) mus
 the same way: index `i` maps to the same hexadecimal encoding and the same `mehcached_hash_key()`
 hash used above. Setting `--prepopulate-nb-items=0` (the default) skips prepopulation entirely and
 the server starts with an empty table.
+
+## Runtime considerations
+
+MICA has no client of its own -- whatever sends it requests must speak its wire format directly.
+`tools/gen_packets.py` is a small scapy-based script that does exactly that: it builds
+protocol-correct requests, sends them, and decodes the reply, either as a one-off (`send`) or as a
+SET/GET round-trip check (`selftest`). It is meant to answer "is MICA working?", not to generate
+load -- see the script's own `--help` for usage.
+
+A request packet looks like this, from Ethernet up to MICA's own application layer:
+
+- **Ethernet (14 bytes):** dst MAC must be the real MAC of the NIC `netbench_server` owns (printed
+  at server startup) so the frame actually reaches the right port; src MAC is never inspected;
+  EtherType `0x0800` (IPv4).
+- **IPv4 (20 bytes, no options):** protocol `17` (UDP); src/dst addresses are arbitrary and never
+  matched or validated -- MICA's `rte_flow` rule wildcards the whole IPv4 layer. Note the server's
+  reply doesn't recompute the checksum after mutating the length field, so don't trust it either.
+- **UDP (8 bytes):** src port is arbitrary (mirrored back on the reply so it finds its way to you);
+  dst port is MICA's routing "mapping_id" -- the one field actually matched by `rte_flow` to steer
+  the packet to a queue/lcore. `0` routes to the partition's exclusive owner thread (`--thread-id`);
+  `1024+N` targets thread `N` directly (spread routing, only meaningful with concurrent reads/writes
+  enabled).
+- **MICA batch header (6 bytes, `struct mehcached_batch_packet` in `src/proto.h`):** `num_requests`
+  (1 byte, max 36), `reserved0` (1 byte), `opaque` (4 bytes, echoed back, used for load feedback).
+- **Per request (24 bytes each, `struct mehcached_request` in `src/table.h`), `num_requests` of
+  them back to back:** `operation` (1 byte -- GET/SET/ADD/INCREMENT/NOOP_*; DELETE and TEST exist in
+  the enum but aren't implemented server-side), `result` (1 byte, sent as 0, overwritten by the
+  server), `reserved0` (2 bytes), `kv_length_vec` (4 bytes: top 8 bits key length, low 24 bits value
+  length), `key_hash` (8 bytes, **client-supplied and trusted as-is** -- see below), `expire_time`
+  (4 bytes), `reserved1` (4 bytes).
+- **Trailing key/value data**, concatenated per request in the same order, each field individually
+  padded up to the next 8-byte boundary: key bytes, then value bytes (value omitted entirely for
+  GET, whose `kv_length_vec` value-length is 0).
+
+On that `key_hash` field: MICA's table code (`src/table.c`) never re-derives it from the key bytes,
+it just trusts whatever the request carries and uses it directly for bucket addressing and the
+stored-item match check -- hashing is pushed onto whatever generates the request instead of being
+redone by the server every time. A client that only ever reads back keys it wrote itself could use
+any deterministic hash function and still work correctly. To also read back the data
+`--prepopulate-*` loaded (see above), a client's hash must match the server's own
+`mehcached_hash_key()` (`CityHash64`, from `src/city.c`) exactly -- which is what `gen_packets.py`
+does, having been checked byte-for-byte against the real C implementation.
 
 ## License
 
