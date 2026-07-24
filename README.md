@@ -1,149 +1,126 @@
-MICA
-====
+# modern MICA
 
 A fast in-memory key-value store.
 
+Adapted from the Initial MICA paper, this aim to modernize the 2014 codebase with modern designs and DPDK versions. Mainly :
 
-A note on the client
----------------------
+- The hotkey logic that allowed users to manually assign heavily requested keys to separated cores has been removed.
+- Each application uses one single port and contains one partition. This forces both a *single port per application* and *single partition per application* logic. In order to multiply partitions, simply run the application multiple times, one on each port.
+- The client is gone, users can now use their own packet generation method to run the application.
+- The benchmark is gone, users can use their own benchmarking system.
+- DPDK API calls have been moved to 23.11 compatible calls.
 
-MICA no longer ships its own load-generating client (the old `netbench_client*` executables and
-the `mehcached_workload_conf`/`mehcached_get_workload_conf` config format that drove them are gone).
-Generating and sending requests into `netbench_server` is the caller's responsibility -- use
-whatever external packet generator or test harness you like. Whatever you use needs to speak
-MICA's wire format (see `src/proto.h` for the packet layout and `mehcached_hash_key()` in
-`src/netbench_server.c` for the key-hashing scheme that determines partition ownership/routing).
+## Building
 
+### Prerequisites
 
-Hardware Requirements
----------------------
+- linux x86_64
+- gcc
+- cmake >= 3.6
+- DPDK, exposed to `pkg-config` as `libdpdk` (verified against DPDK 23.11) -- installed as a normal
+  system package, or via `meson`/`ninja`/`ninja install` from source. `pkg-config --exists libdpdk`
+  must succeed; no DPDK source tree needs to sit next to `mica/`.
+- Hugepages set up and a NIC bound to a DPDK-usable driver (`vfio-pci`, `uio_pci_generic`, etc. via
+  `dpdk-hugepages.py`/`dpdk-devbind.py`). This is regular DPDK/machine setup, independent of MICA
+  itself, and is not covered here.
 
- * NICs supported by DPDK, with a PMD that implements `rte_flow` ETH/IPV4/UDP matching + a QUEUE
-   action (the original 2014 code assumed Intel 82599 "ixgbe" 10 GbE NICs specifically and its own
-   Flow Director filters; see "A note on DPDK version" below for why that changed).
- * Note: The current codebase has several assumptions on the hardware configuration of the server.
-         It runs ideally on a dual octa-core server with 4 dual-port 10 GbE NICs.
- * `netbench_server.c` also hardcodes a couple of PCI addresses to blacklist
-   (`"-b", "0000:06:00.0"`, `"-b", "0000:06:00.1"` in `mehcached_benchmark_server()`), left over from
-   the original 2014 test machine. These almost certainly don't match your hardware's PCI addresses,
-   so update or remove those `-b` arguments for your machine before running.
+### Build steps
 
+```sh
+cmake -Bbuild
+cd build
+make
+```
 
-Software Requirements
----------------------
+This produces the following executables in `build/`:
 
- * linux x86_64 >= 3.2.0
- * gcc >= 4.6.0
- * Python >= 2.7.0
- * DPDK, exposed to `pkg-config` as `libdpdk` (see "A note on DPDK version" below)
- * bash >= 4.0.0
- * cmake >= 3.6
- * Hugepages and a NIC bound to a DPDK-usable driver, set up ahead of time (see "A note on DPDK
-   version" below) -- this is regular machine/DPDK setup, independent of MICA itself.
-
-
-A note on DPDK version
------------------------
-
-This codebase originally targeted Intel DPDK 1.5 (2014) and expected a hand-built copy of it living
-in a sibling `DPDK/` directory next to `mica/`, configured via `RTE_SDK`/`RTE_TARGET` and linked
-against a fixed list of `.a` files. It has since been updated to build against a **modern DPDK
-(verified with 23.11)** installed as a normal system package (or any DPDK built with `meson`/`ninja`
-and `ninja install`), discovered the standard modern way via `pkg-config libdpdk`. Concretely:
-
- * You no longer need to unpack a DPDK source tree next to `mica/`, and `scripts/setup_dkdp_env.sh`
-   (which built old DPDK from source and loaded the `igb_uio` kernel module) is obsolete -- it is
-   kept only for reference to the pre-migration process. Install DPDK on your system such that
-   `pkg-config --exists libdpdk` succeeds; that's the only thing MICA's own build depends on.
- * The legacy Flow Director-based request steering (`rte_eth_dev_fdir_*`) was ported to the generic
-   `rte_flow` API, since Flow Director itself was removed from modern DPDK. See the comments around
-   `mehcached_set_dst_port_mapping()` in `src/net_common.c` for the details of that migration.
- * Hugepage setup and binding a NIC to a userspace driver (`vfio-pci`, `uio_pci_generic`, etc. via
-   DPDK's own `dpdk-devbind.py`/`dpdk-hugepages.py`) are ordinary DPDK prerequisites, not something
-   MICA's build or these instructions cover -- set those up per your own DPDK install/distro's
-   documentation before running any of the executables below. `scripts/unbind.sh`, which used the
-   old `DPDK/tools/pci_unbind.py`, is obsolete for the same reason.
+| Executable | Description |
+|---|---|
+| `netbench_server` | MICA server, cache mode |
+| `netbench_server_store` | MICA server, store mode (no eviction) |
+| `netbench_server_latency` | MICA server, cache mode, instrumented for end-to-end latency measurement |
+| `netbench_server_soft_fdir` | MICA server, cache mode, using software-based request steering instead of `rte_flow` |
+| `test` | table API correctness check |
+| `load` | table fill/read-back success-rate check |
 
 
-Executables
------------
+## Running
 
- * build/netbench_server: MICA server in cache mode
- * build/netbench_server_store: MICA server in store mode
- * build/netbench_server_latency: MICA server in cache mode modified for end-to-end latency measurement
- * build/netbench_server_soft_fdir: MICA server in cache mode using software-based request direction
- * build/netbench_analysis: workload analyzer (used for generating preset server configurations)
- * build/microbench: a local microbenchmark for MICA in cache mode
- * build/microbench_store: a local microbenchmark for MICA in store mode
- * build/test: a simple feature test program
- * build/load: a load factor experiment
+`netbench_server` (and its `_latency`/`_soft_fdir`/`_store` variants) is a standard DPDK
+application: EAL options come first on the command line, followed by `--`, followed by the
+application's own options, e.g.:
 
+```sh
+sudo ./netbench_server -l 0-3 -n 4 -b 0000:06:00.1 -- \
+    --num-items=1000000 --alloc-size=134217728 \
+    --concurrent-table-read=1 --concurrent-table-write=0 --concurrent-alloc-write=0 \
+    --thread-id=0 --mth-threshold=0.5 \
+    --prepopulate-nb-items=1000000 --prepopulate-key-length=8 --prepopulate-value-length=8 \
+    0
+```
 
-Compiling Executables
----------------------
+EAL options (`-l`, `-n`, `-m`/`--socket-mem`, `-a`/`-b`, `--file-prefix`, ...) are standard DPDK and
+not covered here. A single instance serves exactly one partition on one port; to serve multiple
+partitions, run multiple instances (each with its own `--file-prefix` and its own port, e.g. via
+`-a`/`-b` PCI allow/block-listing).
 
-MICA is built with CMake; the only DPDK-specific prerequisite is that `pkg-config --exists libdpdk`
-succeeds (see "A note on DPDK version" above) -- no DPDK source tree needs to sit next to `mica/`
-any more.
+### Application parameters
 
-	$ cd mica
-	$ mkdir build && cd build
-	$ cmake ..
-	$ make
+| Parameter | Description |
+|---|---|
+| `--num-items=N` | expected number of items the partition's hash table should be sized for |
+| `--alloc-size=N` | total bytes budgeted for the partition's item log/allocator |
+| `--concurrent-table-read=0\|1` | allow concurrent reads from multiple threads |
+| `--concurrent-table-write=0\|1` | allow concurrent writes from multiple threads |
+| `--concurrent-alloc-write=0\|1` | use a single shared allocator instead of one per writing thread (only meaningful when `--concurrent-table-write=1`) |
+| `--thread-id=N` | lcore id of this partition's exclusive owner thread (the thread that UDP dst port `0` routes writes to) |
+| `--mth-threshold=F` | move-to-head threshold for the LRU/FIFO eviction policy, from `0.0` (full LRU) to `1.0` (full FIFO) |
+| `--prepopulate-nb-items=N` | number of synthetic items to preload before the server starts accepting requests (`0` disables prepopulation) |
+| `--prepopulate-key-length=N` | byte length of each synthetic prepopulated key |
+| `--prepopulate-value-length=N` | byte length of each synthetic prepopulated value |
+| *`CPU-MODE`* (positional) | right-shift applied to the detected lcore count to decide how many of the polled lcores actually run the server loop (`0` = all lcores; `1` = half; `2` = a quarter; ...) -- mainly useful for isolating single/few-core performance |
+| *`TARGET-REQUEST-RATE`* (positional, `netbench_server_latency` only) | fixes the server's self-throttling target request rate (ops/s) instead of letting it adapt automatically |
 
-This is exactly what the bundled `configure_all.sh`/`configure_server.sh` wrapper scripts do (they
-just set a `cmake` cache variable first -- `NDEBUG=yes` to disable extra runtime checks; `configure_server.sh`
-is currently equivalent to `configure_all.sh` since there are no client-only executables left to
-distinguish it from):
+The concurrency flags above select MICA's classic access modes:
 
-	$ cd mica
-	$ ./configure_all.sh	# or configure_server.sh
-	$ cd build
-	$ make
+| Mode | read | write | alloc-write |
+|---|---|---|---|
+| EREW (exclusive read/write) | 0 | 0 | 0 |
+| CREW (concurrent read, exclusive write) | 1 | 0 | 0 |
+| CRCW (concurrent read/write, per-thread allocators) | 1 | 1 | 0 |
+| CRCWS (concurrent read/write, single shared allocator) | 1 | 1 | 1 |
 
+### Prepopulation
 
-Generating Configuration Files
-------------------------------
+If `--prepopulate-nb-items` is greater than `0`, the server fills its table with that many
+synthetic key-value pairs before it starts accepting any real requests. **This data is not
+random -- it is fully deterministic and reproducible**, generated the same way on every run:
 
-	# conf_* files determine how MICA uses system resources. build/gen_confs.py generates a preset of server configuration files for a 16-core server
-	# in mica
-	$ ./run_analysis_for_conf.py	# this uses sudo
-	$ ./gen_confs.py
+- Keys are simply the integers `0` to `--prepopulate-nb-items - 1`, each encoded as a
+  variable-length hexadecimal string padded to `--prepopulate-key-length` bytes, and hashed with
+  the exact same scheme (`mehcached_hash_key()`) real requests are hashed with.
+- Values are a fixed, self-verifying 8-byte bit pattern derived from the key's index (the low and
+  high 32 bits are bitwise complements of each other), zero-padded to `--prepopulate-value-length`
+  bytes. They are placeholder data for exercising the store, not meaningful content.
 
+Because key generation is deterministic, an external client that wants to read back prepopulated
+keys (e.g. to issue `GET`s against a warmed-up table instead of only `SET`s) must generate keys
+the same way: index `i` maps to the same hexadecimal encoding and the same `mehcached_hash_key()`
+hash used above. Setting `--prepopulate-nb-items=0` (the default) skips prepopulation entirely and
+the server starts with an empty table.
 
-Running a Server
-----------------
+## License
 
-	# in mica/build
-	$ sudo ./netbench_server conf_machines_DATASET_CMODE_0.5 server 0 conf_prepopulation_empty
-	# DATASET=0,1,2 (used to determine how much memory to allocate); CMODE=EREW,CREW,CRCWS (specifies the data access mode)
+    Copyright 2014 Carnegie Mellon University
 
-There is no bundled client any more -- see "A note on the client" above for how to send requests
-into a running server.
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
 
+        http://www.apache.org/licenses/LICENSE-2.0
 
-Running a Local Microbenchmark
-------------------------------
-
-	# in mica/build
-	$ sudo ./microbench CMODE SKEWNESS 0.5
-	# CMODE=EREW,CREW,CRCWS (specifies the data acces mode); SKEWNESS=0(uniform),0.99(skewed),99(single) (specifies the workload skew)
-
-
-License
--------
-
-	Copyright 2014 Carnegie Mellon University
-
-	Licensed under the Apache License, Version 2.0 (the "License");
-	you may not use this file except in compliance with the License.
-	You may obtain a copy of the License at
-
-	    http://www.apache.org/licenses/LICENSE-2.0
-
-	Unless required by applicable law or agreed to in writing, software
-	distributed under the License is distributed on an "AS IS" BASIS,
-	WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-	See the License for the specific language governing permissions and
-	limitations under the License.
-
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.

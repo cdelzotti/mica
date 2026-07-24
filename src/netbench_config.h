@@ -18,7 +18,6 @@
 #include "net_common.h"
 
 //#define MEHCACHED_MAX_PORTS (8)
-#define MEHCACHED_MAX_PARTITIONS (64)	// still used by microbench.c's own local (non-networked) multi-partition benchmark
 
 // server
 struct mehcached_server_partition_conf
@@ -49,15 +48,11 @@ struct mehcached_server_conf
 
 
 // prepopulation
+// populated directly from CLI arguments now (--prepopulate-nb-items, --prepopulate-key-length,
+// --prepopulate-value-length; see main() in netbench_server.c) -- no config file involved.
 struct mehcached_prepopulation_conf
 {
-	// TODO: support multiple datasets
 	uint64_t num_items;
 	size_t key_length;
 	size_t value_length;
 };
-
-
-// functions
-struct mehcached_prepopulation_conf *
-mehcached_get_prepopulation_conf(const char *filename, const char *server_name);

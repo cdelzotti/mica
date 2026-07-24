@@ -1221,14 +1221,16 @@ mehcached_benchmark_prepopulate_proc(void *arg)
 
 static
 void
-mehcached_benchmark_server(const struct mehcached_server_partition_conf *partition_conf, const char *server_name, int cpu_mode, const char *prepopulation_filename)
+mehcached_benchmark_server(const struct mehcached_server_partition_conf *partition_conf, int cpu_mode, const struct mehcached_prepopulation_conf *prepopulation_conf_arg)
 {
-    // the partition's config is now taken directly from CLI arguments (see main()) instead of a
-    // conf_machines_* file -- num_ports is filled in below once DPDK reports how many ports exist.
+    // the partition's config and the prepopulation dataset shape are both taken directly from CLI
+    // arguments now (see main()) -- num_ports is filled in below once DPDK reports how many ports
+    // exist.
     struct mehcached_server_conf *server_conf = malloc(sizeof(struct mehcached_server_conf));
     memset(server_conf, 0, sizeof(struct mehcached_server_conf));
     server_conf->partition = *partition_conf;
-    struct mehcached_prepopulation_conf *prepopulation_conf = mehcached_get_prepopulation_conf(prepopulation_filename, server_name);
+    struct mehcached_prepopulation_conf *prepopulation_conf = malloc(sizeof(struct mehcached_prepopulation_conf));
+    *prepopulation_conf = *prepopulation_conf_arg;
 
     mehcached_stopwatch_init_start();
 
@@ -1241,37 +1243,11 @@ mehcached_benchmark_server(const struct mehcached_server_partition_conf *partiti
 
     mehcached_shm_init(page_size, num_numa_nodes, num_pages_to_try, num_pages_to_reserve);
 
-    printf("initializing DPDK\n");
+    // EAL is already initialized by main() before this function is called -- see the comment there.
 
-    char memory_str[10];
-    snprintf(memory_str, sizeof(memory_str), "%zu", (num_pages_to_try - num_pages_to_reserve) * 2);   // * 2 is because the used huge page size is 2 MB
-
-    // no "-c"/"-l" core mask here: which cores this process gets is decided externally (taskset,
-    // cgroups, numactl, or simply the machine's default affinity), not by MICA. Omitting it entirely
-    // makes EAL auto-detect and use every core already in this process's own CPU affinity set.
-    char *rte_argv[] = {"",
-        "-n", "4",    // 4 for server
-        "-m", memory_str,
-        "-b", "0000:06:00.0",
-        "-b", "0000:06:00.1",
-    };
-    int rte_argc = sizeof(rte_argv) / sizeof(rte_argv[0]);
-
-    //rte_log_set_global_level(RTE_LOG_DEBUG);
-    rte_log_set_global_level(RTE_LOG_NOTICE);	// rte_set_log_level() was renamed rte_log_set_global_level()
-
-    int ret = rte_eal_init(rte_argc, rte_argv);
-    if (ret < 0)
-    {
-        fprintf(stderr, "failed to initialize EAL\n");
-        return;
-    }
-
-    // thread count = however many cores EAL was actually given (1 thread per core). This is no
-    // longer a config value at all -- mehcached_server_conf has no num_threads field any more, and
-    // every other place in this file that needs the thread count calls rte_lcore_count() directly.
-    // The config file's server_thread lines are only responsible for each thread's port_id now, and
-    // must supply at least rte_lcore_count() of them.
+    // thread count = however many cores EAL was actually given (1 thread per core), via whatever
+    // "-l"/"-c" (or lack thereof) was passed on the command line -- not a config value at all;
+    // every place in this file that needs the thread count calls rte_lcore_count() directly.
     uint64_t cpu_mask = ((uint64_t)1 << rte_lcore_count()) - 1;
 
     // port count = however many ports DPDK actually reports, full stop -- not a config value.
@@ -1529,20 +1505,38 @@ mehcached_benchmark_server(const struct mehcached_server_partition_conf *partiti
 }
 
 int
-main(int argc, const char *argv[])
+main(int argc, char *argv[])
 {
-    // the partition's config used to come from a conf_machines_* file; it's now taken directly as
-    // named CLI arguments, since a single instance only ever describes its own one partition.
+    // standard modern DPDK invocation (see e.g. examples/skeleton/basicfwd.c): EAL options
+    // (-l, -n, -m/--socket-mem, -a/-b, --file-prefix, ...) are given directly on the command line,
+    // followed by "--", followed by this application's own arguments below. rte_eal_init() parses
+    // and consumes everything up to and including that "--" and returns how many argv entries that
+    // was, so the remainder is this program's own to parse.
+    int eal_parsed_argc = rte_eal_init(argc, argv);
+    if (eal_parsed_argc < 0)
+        rte_exit(EXIT_FAILURE, "invalid EAL arguments\n");
+    argc -= eal_parsed_argc;
+    argv += eal_parsed_argc;
+
+    rte_log_set_global_level(RTE_LOG_NOTICE);	// rte_set_log_level() was renamed rte_log_set_global_level()
+
+    // the partition's config and the prepopulation dataset shape both used to come from config
+    // files (a conf_machines_* file and a conf_prepopulation_* file respectively); both are now
+    // taken directly as named CLI arguments, since a single instance only ever describes its own
+    // one partition and prepopulates it with one synthetic dataset.
     struct mehcached_server_partition_conf partition;
     memset(&partition, 0, sizeof(partition));
+    struct mehcached_prepopulation_conf prepopulation;
+    memset(&prepopulation, 0, sizeof(prepopulation));
 
-    const char *positional[4];
+    const char *positional[2];
     int num_positional = 0;
 
     int arg_index;
     for (arg_index = 1; arg_index < argc; arg_index++)
     {
         uint64_t u64_value;
+        size_t size_value;
         int int_value;
         double double_value;
         if (sscanf(argv[arg_index], "--num-items=%lu", &u64_value) == 1)
@@ -1559,26 +1553,32 @@ main(int argc, const char *argv[])
             partition.thread_id = (uint8_t)int_value;
         else if (sscanf(argv[arg_index], "--mth-threshold=%lf", &double_value) == 1)
             partition.mth_threshold = double_value;
-        else if (num_positional < 4)
+        else if (sscanf(argv[arg_index], "--prepopulate-nb-items=%lu", &u64_value) == 1)
+            prepopulation.num_items = u64_value;
+        else if (sscanf(argv[arg_index], "--prepopulate-key-length=%zu", &size_value) == 1)
+            prepopulation.key_length = size_value;
+        else if (sscanf(argv[arg_index], "--prepopulate-value-length=%zu", &size_value) == 1)
+            prepopulation.value_length = size_value;
+        else if (num_positional < 2)
             positional[num_positional++] = argv[arg_index];
     }
 
 #ifndef MEHCACHED_MEASURE_LATENCY
-    if (num_positional < 3)
+    if (num_positional < 1)
     {
-        printf("%s --num-items=N --alloc-size=N --concurrent-table-read=0|1 --concurrent-table-write=0|1 --concurrent-alloc-write=0|1 --thread-id=N --mth-threshold=F SERVER-NAME CPU-MODE PREPOPULATION-FILENAME\n", argv[0]);
+        printf("%s --num-items=N --alloc-size=N --concurrent-table-read=0|1 --concurrent-table-write=0|1 --concurrent-alloc-write=0|1 --thread-id=N --mth-threshold=F --prepopulate-nb-items=N --prepopulate-key-length=N --prepopulate-value-length=N CPU-MODE\n", argv[0]);
         return EXIT_FAILURE;
     }
 #else
-    if (num_positional < 4)
+    if (num_positional < 2)
     {
-        printf("%s --num-items=N --alloc-size=N --concurrent-table-read=0|1 --concurrent-table-write=0|1 --concurrent-alloc-write=0|1 --thread-id=N --mth-threshold=F SERVER-NAME CPU-MODE PREPOPULATION-FILENAME TARGET-REQUEST-RATE\n", argv[0]);
+        printf("%s --num-items=N --alloc-size=N --concurrent-table-read=0|1 --concurrent-table-write=0|1 --concurrent-alloc-write=0|1 --thread-id=N --mth-threshold=F --prepopulate-nb-items=N --prepopulate-key-length=N --prepopulate-value-length=N CPU-MODE TARGET-REQUEST-RATE\n", argv[0]);
         return EXIT_FAILURE;
     }
-    target_request_rate_from_user = (uint32_t)atoi(positional[3]);
+    target_request_rate_from_user = (uint32_t)atoi(positional[1]);
 #endif
 
-    mehcached_benchmark_server(&partition, positional[0], atoi(positional[1]), positional[2]);
+    mehcached_benchmark_server(&partition, atoi(positional[0]), &prepopulation);
 
     return EXIT_SUCCESS;
 }
