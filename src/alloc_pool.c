@@ -52,7 +52,12 @@ mehcached_pool_init(struct mehcached_pool *alloc, uint64_t size, bool concurrent
 	}
     while (true)
     {
-		alloc->data = mehcached_shm_find_free_address(size + MEHCACHED_MINIMUM_POOL_SIZE);
+		// the aliasing map below always consumes one full huge page of address space
+		// (mehcached_shm_map() maps whole pages regardless of the length it's asked for), so the
+		// reservation must leave room for a full mehcached_shm_get_page_size() -- not
+		// MEHCACHED_MINIMUM_POOL_SIZE, which is a minimum *pool* size, unrelated to page size and
+		// possibly smaller than it (e.g. on a machine with 1 GB huge pages)
+		alloc->data = mehcached_shm_find_free_address(size + mehcached_shm_get_page_size());
 		if (alloc->data == NULL)
 			assert(false);
 

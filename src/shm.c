@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#define _GNU_SOURCE
+
 #include "shm.h"
 
 #include "util.h"
 
 #include <fcntl.h>
 #include <sys/mman.h>
-#include <linux/limits.h>
+#include <linux/memfd.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -31,11 +33,18 @@
 
 MEHCACHED_BEGIN
 
+// Backing store for MICA's own hugepage-based shared memory: each page is an anonymous
+// memfd_create(MFD_HUGETLB) object (Linux >= 4.14), not a file under some hugetlbfs mountpoint.
+// This is what modern DPDK apps do too -- they never touch a mount path directly, they just ask
+// the kernel's hugepage pool for memory (see e.g. how EAL's own memalloc backend works). The huge
+// page size itself is auto-detected from /proc/meminfo instead of assumed, since it varies by
+// machine (this codebase used to hardcode 2 MB, which fails outright on any machine configured
+// for 1 GB pages only). Because there's no on-disk path, there's also nothing to clean up between
+// runs: the kernel reclaims a memfd's hugepages the moment its last fd closes, including on crash.
 struct mehcached_shm_page
 {
-	char path[PATH_MAX];
+	int fd;			// kept open for the page's lifetime so it can be mmap()'d again later
 	void *addr;
-	void *paddr;
 	size_t numa_node;
 	size_t in_use;
 };
@@ -69,29 +78,76 @@ static struct mehcached_shm_entry mehcached_shm_entries[MEHCACHED_SHM_MAX_ENTRIE
 static struct mehcached_shm_mapping mehcached_shm_mappings[MEHCACHED_SHM_MAX_MAPPINGS];
 static size_t mehcached_shm_used_memory;
 
-static const char *mehcached_shm_path_prefix = "/mnt/huge/mehcached_shm_";
-
 size_t
 mehcached_shm_adjust_size(size_t size)
 {
-    return (uint64_t)MEHCACHED_ROUNDUP2M(size);
+    // must round up to the *real* detected huge page size (mehcached_shm_page_size), not a
+    // hardcoded 2 MB: mehcached_shm_map() always maps a full huge page per page it touches
+    // (see below), so any caller-visible size handed to mehcached_shm_find_free_address()/
+    // mehcached_shm_map() has to already be a multiple of the real page size, or the actual
+    // mapping silently overruns whatever smaller address window was reserved for it. This used
+    // to be safe when the page size itself was also hardcoded to 2 MB; it stopped being safe the
+    // moment the page size became auto-detected (e.g. 1 GB on machines configured for 1 GB pages).
+    assert(mehcached_shm_page_size != 0);  // mehcached_shm_init() must run first
+    size_t page_size = mehcached_shm_page_size;
+    return (size + page_size - 1) & ~(page_size - 1);
 }
 
 static
-void
-mehcached_clean_files()
+size_t
+mehcached_shm_detect_hugepage_size()
 {
-	char cmd[PATH_MAX];
-	snprintf(cmd, PATH_MAX, "rm %s* > /dev/null 2>&1", mehcached_shm_path_prefix);
-	int ret = system(cmd);
-	(void)ret;
+	// the system's actual huge page size (e.g. 2 MB or 1 GB) -- this must match exactly what we
+	// ask memfd_create() for below, so it is detected, never assumed
+	FILE *f = fopen("/proc/meminfo", "r");
+	if (f == NULL)
+	{
+		perror("");
+		assert(false);
+	}
+
+	size_t hugepage_size_kb = 0;
+	char buf[BUFSIZ];
+	while (fgets(buf, sizeof(buf), f) != NULL)
+	{
+		if (sscanf(buf, "Hugepagesize: %zu kB", &hugepage_size_kb) == 1)
+			break;
+	}
+	fclose(f);
+
+	if (hugepage_size_kb == 0)
+	{
+		printf("error: could not determine the system's huge page size from /proc/meminfo -- "
+			"are hugepages configured at all? check /proc/sys/vm/nr_hugepages or "
+			"/sys/kernel/mm/hugepages/\n");
+		assert(false);
+	}
+
+	return hugepage_size_kb * 1024;
 }
 
 static
-void
-mehcached_shm_path(size_t page_id, char out_path[PATH_MAX])
+unsigned int
+mehcached_shm_encode_huge_page_flag(size_t page_size)
 {
-	snprintf(out_path, PATH_MAX, "%s%zu", mehcached_shm_path_prefix, page_id);
+	// MFD_HUGE_2MB/MFD_HUGE_1GB/etc. are just (log2(page_size) << MFD_HUGE_SHIFT); compute this
+	// generically instead of picking among the handful of named constants, so any huge page size
+	// the kernel supports works, not just the ones glibc happens to have macros for
+	assert(mehcached_next_power_of_two(page_size) == page_size);
+	unsigned int log2_page_size = (unsigned int)__builtin_ctzll((unsigned long long)page_size);
+	return log2_page_size << MFD_HUGE_SHIFT;
+}
+
+static
+int
+mehcached_shm_compare_vaddr(const void *a, const void *b)
+{
+    const struct mehcached_shm_page *pa = (const struct mehcached_shm_page *)a;
+    const struct mehcached_shm_page *pb = (const struct mehcached_shm_page *)b;
+    if (pa->addr < pb->addr)
+        return -1;
+    else
+        return 1;
 }
 
 static
@@ -128,79 +184,66 @@ mehcached_shm_dump_page_info()
 	mehcached_shm_unlock();
 }
 
-static
-int
-mehcached_shm_compare_paddr(const void *a, const void *b)
-{
-	const struct mehcached_shm_page *pa = (const struct mehcached_shm_page *)a;
-	const struct mehcached_shm_page *pb = (const struct mehcached_shm_page *)b;
-	if (pa->paddr < pb->paddr)
-		return -1;
-	else
-		return 1;
-}
-
-static
-int
-mehcached_shm_compare_vaddr(const void *a, const void *b)
-{
-	const struct mehcached_shm_page *pa = (const struct mehcached_shm_page *)a;
-	const struct mehcached_shm_page *pb = (const struct mehcached_shm_page *)b;
-	if (pa->addr < pb->addr)
-		return -1;
-	else
-		return 1;
-}
-
 void
-mehcached_shm_init(size_t page_size, size_t num_numa_nodes, size_t num_pages_to_try, size_t num_pages_to_reserve)
+mehcached_shm_init(size_t num_numa_nodes, size_t total_bytes_to_reserve)
 {
-	assert(mehcached_next_power_of_two(page_size) == page_size);
 	assert(num_numa_nodes >= 1);
-	assert(num_pages_to_try <= MEHCACHED_SHM_MAX_PAGES);
-	assert(num_pages_to_reserve <= num_pages_to_try);
-
-	size_t page_id;
-	size_t numa_node;
-
-	printf("cleaning up existing files\n");
-	mehcached_clean_files();
 
 	mehcached_shm_state_lock = 0;
-	mehcached_shm_page_size = page_size;
 	memset(mehcached_shm_pages, 0, sizeof(mehcached_shm_pages));
 	memset(mehcached_shm_entries, 0, sizeof(mehcached_shm_entries));
 	memset(mehcached_shm_mappings, 0, sizeof(mehcached_shm_mappings));
 	mehcached_shm_used_memory = 0;
+
+	printf("detecting huge page size\n");
+	mehcached_shm_page_size = mehcached_shm_detect_hugepage_size();
+	unsigned int huge_page_flag = mehcached_shm_encode_huge_page_flag(mehcached_shm_page_size);
+	printf("using %zu-byte huge pages\n", mehcached_shm_page_size);
+
+	size_t num_pages_to_reserve = (total_bytes_to_reserve + mehcached_shm_page_size - 1) / mehcached_shm_page_size;
+	// try somewhat more pages than strictly needed: without explicit NUMA binding, first-touch
+	// page placement across nodes isn't guaranteed to be even, so we over-allocate a bit and let
+	// the "throw away surplus pages" step below free whatever we didn't need on each node
+	size_t num_pages_to_try = num_pages_to_reserve + num_pages_to_reserve / 7 + 1;
+	if (num_pages_to_try > MEHCACHED_SHM_MAX_PAGES)
+		num_pages_to_try = MEHCACHED_SHM_MAX_PAGES;
+	if (num_pages_to_reserve > num_pages_to_try)
+	{
+		printf("error: total_bytes_to_reserve (%zu) needs more pages than MEHCACHED_SHM_MAX_PAGES allows\n", total_bytes_to_reserve);
+		assert(false);
+	}
+
+	size_t page_id;
+	size_t numa_node;
 
 	// initialize pages
 	printf("initializing pages\n");
 	size_t num_allocated_pages;
 	for (page_id = 0; page_id < num_pages_to_try; page_id++)
 	{
-		char path[PATH_MAX];
-		mehcached_shm_path(page_id, path);
-
-		int fd = open(path, O_CREAT | O_RDWR, 0755);
+		int fd = memfd_create("mehcached_shm", MFD_CLOEXEC | MFD_HUGETLB | huge_page_flag);
 		if (fd == -1)
+			break;	// no more huge pages available in the kernel's pool
+
+		if (ftruncate(fd, (off_t)mehcached_shm_page_size) == -1)
 		{
-			perror("");
-			assert(false);
+			close(fd);
+			break;
 		}
 
-		void *p = mmap(NULL, page_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-
-		close(fd);
-
+		void *p = mmap(NULL, mehcached_shm_page_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 		if (p == (void *)-1)
+		{
+			close(fd);
 			break;
+		}
 
 		// this is required to cause a page fault and invoke actual memory allocation
 		*(size_t *)p = 0;
 
-		strncpy(mehcached_shm_pages[page_id].path, path, PATH_MAX);
+		mehcached_shm_pages[page_id].fd = fd;
 		mehcached_shm_pages[page_id].addr = p;
-		//printf("initial allocation of %zu on %p\n", page_size, p);
+		//printf("initial allocation of %zu on %p\n", mehcached_shm_page_size, p);
 	}
 	num_allocated_pages = page_id;
 
@@ -227,7 +270,6 @@ mehcached_shm_init(size_t page_size, size_t num_numa_nodes, size_t num_pages_to_
 			break;
 
 		size_t addr = strtoull(buf, NULL, 16);
-		// for (page_id = 0; page_id < num_allocated_pages; page_id++)
 		if (page_id < num_allocated_pages)
 		{
 			if (mehcached_shm_pages[page_id].addr == (void *)addr)
@@ -256,58 +298,6 @@ mehcached_shm_init(size_t page_size, size_t num_numa_nodes, size_t num_pages_to_
 		assert(false);
 	}
 
-    // get physical address (pagemap.txt)
-	printf("detecting physical address of pages\n");
-    size_t normal_page_size = (size_t)getpagesize();
-	int fd = open("/proc/self/pagemap", O_RDONLY);
-    if (fd == -1)
-	{
-		perror("");
-		assert(false);
-	}
-
-	for (page_id = 0; page_id < num_allocated_pages; page_id++)
-	{
-        size_t pfn = (size_t)mehcached_shm_pages[page_id].addr / normal_page_size;
-        off_t offset = (off_t)(sizeof(uint64_t) * pfn);
-
-		if (lseek(fd, offset, SEEK_SET) != offset)
-        {
-            perror("");
-            close(fd);
-            assert(false);
-		}
-
-        uint64_t entry;
-		if (read(fd, &entry, sizeof(uint64_t)) == -1)
-        {
-            perror("");
-            close(fd);
-            assert(false);
-		}
-
-        mehcached_shm_pages[page_id].paddr = (void *)((entry & 0x7fffffffffffffULL) * normal_page_size);
-        //printf("virtual addr %p = physical addr %p\n", mehcached_shm_pages[page_id].addr, mehcached_shm_pages[page_id].paddr);
-    }
-
-    // sort by physical address
-	printf("sorting by physical address\n");
-    // for (page_id = 0; page_id < num_allocated_pages - 1; page_id++)
-    // {
-    //     size_t page_id2;
-    //     for (page_id2 = page_id + 1; page_id2 < num_allocated_pages; page_id2++)
-    //     {
-    //         if (mehcached_shm_pages[page_id].paddr > mehcached_shm_pages[page_id2].paddr)
-    //         {
-    //             struct mehcached_shm_page t;
-    //             memcpy(&t, &mehcached_shm_pages[page_id], sizeof(struct mehcached_shm_page));
-    //             memcpy(&mehcached_shm_pages[page_id], &mehcached_shm_pages[page_id2], sizeof(struct mehcached_shm_page));
-    //             memcpy(&mehcached_shm_pages[page_id2], &t, sizeof(struct mehcached_shm_page));
-    //         }
-    //     }
-    // }
-    qsort(mehcached_shm_pages, num_allocated_pages, sizeof(struct mehcached_shm_page), mehcached_shm_compare_paddr);
-
 	// throw away surplus pages on each numa node
 	printf("releasing unnecessary pages\n");
 	size_t num_pages_per_numa_node = num_pages_to_reserve / num_numa_nodes;
@@ -322,16 +312,15 @@ mehcached_shm_init(size_t page_size, size_t num_numa_nodes, size_t num_pages_to_
         void *addr = mehcached_shm_pages[page_id].addr;
 		if (num_reserved_pages[numa_node] < num_pages_per_numa_node)
         {
-            //printf("reserving page (addr=%p, paddr=%p, numa_node=%zu)\n", addr, mehcached_shm_pages[page_id].paddr, numa_node);
+            //printf("reserving page (addr=%p, numa_node=%zu)\n", addr, numa_node);
 			num_reserved_pages[numa_node]++;
-            //memset(addr, 0, mehcached_shm_page_size);
         }
         else
 		{
 			//printf("deallocating surplus page %p on numa node %zu\n", addr, numa_node);
 
 			munmap(addr, mehcached_shm_page_size);
-			unlink(mehcached_shm_pages[page_id].path);
+			close(mehcached_shm_pages[page_id].fd);
 			memset(&mehcached_shm_pages[page_id], 0, sizeof(mehcached_shm_pages[page_id]));
 
 			num_freed_pages[numa_node]++;
@@ -571,28 +560,20 @@ mehcached_shm_map(size_t entry_id, void *ptr, size_t offset, size_t length)
 		return false;
 	}
 
-	size_t page_offset = offset / mehcached_shm_page_size; 
+	size_t page_offset = offset / mehcached_shm_page_size;
 	size_t num_pages = (length + (mehcached_shm_page_size - 1)) / mehcached_shm_page_size;
 
-	// map
+	// map -- each page's fd was kept open since mehcached_shm_init(), so we just mmap() it again
+	// at the caller's chosen address; no path to reopen (memfd objects have none)
 	void *p = ptr;
 	size_t page_index = page_offset;
 	size_t page_index_end = page_offset + num_pages;
 	int error = 0;
 	while (page_index < page_index_end)
 	{
-		int fd = open(mehcached_shm_pages[mehcached_shm_entries[entry_id].pages[page_index]].path, O_RDWR);
-		if (fd == -1)
-		{
-			perror("");
-			error = 1;
-			assert(false);
-			break;
-		}
+		int fd = mehcached_shm_pages[mehcached_shm_entries[entry_id].pages[page_index]].fd;
 
 		void *ret_p = mmap(p, mehcached_shm_page_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
-
-		close(fd);
 
 		if (ret_p == MAP_FAILED)
 		{
@@ -699,8 +680,6 @@ void *
 mehcached_shm_malloc_contiguous(size_t size, size_t lcore)
 {
     size = mehcached_shm_adjust_size(size);
-    // size_t entry_id = mehcached_shm_alloc(size, (size_t)-1);
-    // size_t entry_id = mehcached_shm_alloc(size, numa_node);
     size_t entry_id = mehcached_shm_alloc(size, rte_lcore_to_socket_id((unsigned int)lcore));
     if (entry_id == (size_t)-1)
     	return NULL;
@@ -831,4 +810,3 @@ mehcached_shm_free_striped(void *ptr)
 }
 
 MEHCACHED_END
-

@@ -117,6 +117,14 @@ protocol-correct requests, sends them, and decodes the reply, either as a one-of
 SET/GET round-trip check (`selftest`). It is meant to answer "is MICA working?", not to generate
 load -- see the script's own `--help` for usage.
 
+```sh
+# --dst-mac is the NIC MAC netbench_server printed at startup ("port 0 MAC: ...")
+sudo ./tools/gen_packets.py --iface eth0 --dst-mac b8:3f:d2:37:42:4e selftest
+
+sudo ./tools/gen_packets.py --iface eth0 --dst-mac b8:3f:d2:37:42:4e send --op set --key hello --value world
+sudo ./tools/gen_packets.py --iface eth0 --dst-mac b8:3f:d2:37:42:4e send --op get --key hello
+```
+
 A request packet looks like this, from Ethernet up to MICA's own application layer:
 
 - **Ethernet (14 bytes):** dst MAC must be the real MAC of the NIC `netbench_server` owns (printed

@@ -31,7 +31,12 @@
 // data room size of each mbuf's packet buffer (excludes struct rte_mbuf itself and its private area,
 // which rte_pktmbuf_pool_create() now accounts for on its own -- see mehcached_init_network())
 #define MEHCACHED_MBUF_DATA_ROOM_SIZE (2048 + RTE_PKTMBUF_HEADROOM)
-#define MEHCACHED_MBUF_SIZE (MEHCACHED_MAX_PORTS * MEHCACHED_MAX_QUEUES * 4096)     // TODO: need to divide by numa node count
+// no longer scaled by MEHCACHED_MAX_PORTS: a single application instance always serves exactly one
+// port now (see the single-port-per-instance design in netbench_server.c/net_common.c), so sizing
+// this pool for up to MEHCACHED_MAX_PORTS (8) ports was pure waste -- ~8x more hugepage-backed mbuf
+// memory than any instance can ever actually use, competing for the same finite system hugepage
+// budget as mehcached_shm_init()'s own allocations (see shm.c).
+#define MEHCACHED_MBUF_SIZE (MEHCACHED_MAX_QUEUES * 4096)     // TODO: need to divide by numa node count
 
 #define MEHCACHED_MAX_PKT_BURST (32)
 
@@ -368,12 +373,11 @@ mehcached_init_network(uint64_t cpu_mask, uint64_t port_mask, uint8_t *out_num_p
 		printf("allocating pktmbuf on node %zu... \n", i);
 		char pool_name[64];
 		snprintf(pool_name, sizeof(pool_name), "pktmbuf_pool%zu", i);
-		// if this is not big enough, RX/TX performance may not be consistent, e.g., between CREW and CRCW experiments
-		// the mempool's per-core cache size ceiling used to be a hand-patched DPDK ./config knob
-		// (CONFIG_RTE_MEMPOOL_CACHE_MAX_SIZE, see scripts/setup_dkdp_env.sh); on a meson-built DPDK
-		// it is instead a build option (-Dmax_mempool_cache_size) baked into whatever package/tree
-		// your system's libdpdk.pc points at, so that is what to check first if this call starts failing.
-		const unsigned int cache_size = MEHCACHED_MAX_PORTS * 1024;
+		// rte_pktmbuf_pool_create() requires cache_size <= RTE_MEMPOOL_CACHE_MAX_SIZE (and <= n/1.5);
+		// the old MEHCACHED_MAX_PORTS*1024 (8192) guess violated that ceiling outright (512 on a
+		// meson-built DPDK by default, tunable via -Dmax_mempool_cache_size) and made this call fail
+		// unconditionally, regardless of how much hugepage memory was actually available.
+		const unsigned int cache_size = RTE_MEMPOOL_CACHE_MAX_SIZE;
 		// rte_pktmbuf_pool_create() replaces the old rte_mempool_create() + rte_pktmbuf_pool_init()/
 		// rte_pktmbuf_init() callback trio: it derives the real mempool element size itself
 		// (sizeof(struct rte_mbuf) + priv_size + data_room_size), so we now only pass the packet

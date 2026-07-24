@@ -25,7 +25,7 @@ void
 mehcached_shm_dump_page_info();
 
 void
-mehcached_shm_init(size_t page_size, size_t num_numa_nodes, size_t num_pages_to_try, size_t num_pages_to_reserve);
+mehcached_shm_init(size_t num_numa_nodes, size_t total_bytes_to_reserve);
 
 void *
 mehcached_shm_find_free_address(size_t size);

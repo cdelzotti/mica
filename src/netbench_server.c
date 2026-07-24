@@ -1236,12 +1236,13 @@ mehcached_benchmark_server(const struct mehcached_server_partition_conf *partiti
 
     printf("initializing shm\n");
 
-    const size_t page_size = 1048576 * 2;
     const size_t num_numa_nodes = 2;
-    const size_t num_pages_to_try = 16384;
-    const size_t num_pages_to_reserve = 16384 - 2048;	// give 2048 pages to dpdk
+    // the huge page size itself is auto-detected (see mehcached_shm_init()) -- DPDK gets its own
+    // memory independently via EAL now, so there's no split to compute here any more, just a flat
+    // budget for MICA's own allocations
+    const size_t total_bytes_to_reserve = 28ULL * 1024 * 1024 * 1024;
 
-    mehcached_shm_init(page_size, num_numa_nodes, num_pages_to_try, num_pages_to_reserve);
+    mehcached_shm_init(num_numa_nodes, total_bytes_to_reserve);
 
     // EAL is already initialized by main() before this function is called -- see the comment there.
 
@@ -1467,14 +1468,12 @@ mehcached_benchmark_server(const struct mehcached_server_partition_conf *partiti
 
     printf("prepopulating servers\n");
 
-    // for (thread_id = 1; thread_id < ((uint8_t)rte_lcore_count()); thread_id++)
-    //     rte_eal_launch(mehcached_benchmark_prepopulate_proc, states, (unsigned int)thread_id);
-    // rte_eal_launch(mehcached_benchmark_prepopulate_proc, states, 0);
-    assert(rte_lcore_to_socket_id(0) == 0);
-    assert(rte_lcore_to_socket_id(1) == 1);
-    rte_eal_launch(mehcached_benchmark_prepopulate_proc, states, 0);
-    rte_eal_mp_wait_lcore();
-    rte_eal_launch(mehcached_benchmark_prepopulate_proc, states, 1);
+    // a single instance serves exactly one partition, so only its owner thread's NUMA node ever
+    // holds real data (see the NUMA check inside mehcached_benchmark_prepopulate_proc()) -- launch
+    // prepopulation directly on that thread instead of a hardcoded lcore 0/1 pair, which assumed a
+    // specific lcore-to-socket layout (lcore 0 on socket 0, lcore 1 on socket 1) that doesn't hold
+    // on every machine and isn't needed now that there's nothing left for a second NUMA node to do.
+    rte_eal_launch(mehcached_benchmark_prepopulate_proc, states, server_conf->partition.thread_id);
     rte_eal_mp_wait_lcore();
 
     size_t mem_diff = mehcached_get_memuse() - mem_start;

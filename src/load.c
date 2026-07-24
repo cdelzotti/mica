@@ -18,6 +18,9 @@
 #include "mehcached.h"
 #include "hash.h"
 
+#include <rte_eal.h>
+#include <rte_debug.h>
+
 void
 test_load()
 {
@@ -77,14 +80,18 @@ test_load()
 }
 
 int
-main(int argc MEHCACHED_UNUSED, const char *argv[] MEHCACHED_UNUSED)
+main(int argc, char *argv[])
 {
-	const size_t page_size = 1048576 * 2;
-	const size_t num_numa_nodes = 2;
-    const size_t num_pages_to_try = 16384;
-    const size_t num_pages_to_reserve = 16384 - 2048;   // give 2048 pages to dpdk
+	// see test.c's main() / netbench_server.c's main() for why this is needed: no packets are
+	// sent here either, but mehcached_shm_alloc()'s NUMA-node auto-detection calls into DPDK's
+	// lcore APIs, which requires EAL to be initialized first.
+	if (rte_eal_init(argc, argv) < 0)
+		rte_exit(EXIT_FAILURE, "invalid EAL arguments\n");
 
-	mehcached_shm_init(page_size, num_numa_nodes, num_pages_to_try, num_pages_to_reserve);
+	const size_t num_numa_nodes = 2;
+	const size_t total_bytes_to_reserve = 28ULL * 1024 * 1024 * 1024;
+
+	mehcached_shm_init(num_numa_nodes, total_bytes_to_reserve);
 
     test_load();
 
