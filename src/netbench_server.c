@@ -113,6 +113,10 @@ static uint32_t target_request_rate_from_user;
 
 static volatile bool exiting = false;
 
+// set once from --debug at startup (see main()), never written again afterward -- safe to read
+// from any thread without synchronization, same as `exiting` above
+static bool debug_enabled = false;
+
 static
 void
 signal_handler(int signum)
@@ -218,6 +222,28 @@ mehcached_remote_send_response(struct server_state *state, struct rte_mbuf *mbuf
     mehcached_send_packet(port_id, mbuf);
 
     state->bytes_tx += (uint64_t)(packet_length + 24);  // 24 for PHY overheads
+}
+
+// --debug: log a line for every packet the server actually pulls off its RX queue (see the call
+// site in mehcached_benchmark_server_proc()). Not for production use -- printf per packet is slow
+// and will itself become the bottleneck under real load; it's meant for manually checking that
+// packets are arriving/routed as expected (e.g. with tools/gen_packets.py).
+static
+void
+mehcached_debug_log_packet(uint8_t thread_id, uint8_t port_id, const struct rte_mbuf *mbuf)
+{
+    const struct mehcached_batch_packet *packet = rte_pktmbuf_mtod(mbuf, const struct mehcached_batch_packet *);
+    const struct rte_ether_hdr *eth = (const struct rte_ether_hdr *)rte_pktmbuf_mtod(mbuf, const unsigned char *);
+    const struct rte_ipv4_hdr *ip = (const struct rte_ipv4_hdr *)((const unsigned char *)eth + sizeof(struct rte_ether_hdr));
+    const struct rte_udp_hdr *udp = (const struct rte_udp_hdr *)((const unsigned char *)ip + sizeof(struct rte_ipv4_hdr));
+
+    uint32_t src_ip = rte_be_to_cpu_32(ip->src_addr);
+    uint16_t src_port = rte_be_to_cpu_16(udp->src_port);
+    uint16_t mapping_id = rte_be_to_cpu_16(udp->dst_port);
+
+    printf("[debug] thread=%hhu port=%hhu size=%uB num_requests=%hhu mapping_id=%hu src=%u.%u.%u.%u:%hu\n",
+        thread_id, port_id, (unsigned int)mbuf->data_len, packet->num_requests, mapping_id,
+        (src_ip >> 24) & 0xff, (src_ip >> 16) & 0xff, (src_ip >> 8) & 0xff, src_ip & 0xff, src_port);
 }
 
 static
@@ -375,6 +401,13 @@ mehcached_benchmark_server_proc(void *arg)
             packet_count = pipeline_size;
             mehcached_receive_packets(port_id, packet_mbufs, &packet_count);
             t_last_rx = t_end;
+
+            if (debug_enabled)
+            {
+                size_t packet_index;
+                for (packet_index = 0; packet_index < packet_count; packet_index++)
+                    mehcached_debug_log_packet(thread_id, port_id, packet_mbufs[packet_index]);
+            }
         }
         else
             packet_count = 0;
@@ -1558,6 +1591,8 @@ main(int argc, char *argv[])
             prepopulation.key_length = size_value;
         else if (sscanf(argv[arg_index], "--prepopulate-value-length=%zu", &size_value) == 1)
             prepopulation.value_length = size_value;
+        else if (strcmp(argv[arg_index], "--debug") == 0)
+            debug_enabled = true;
         else if (num_positional < 2)
             positional[num_positional++] = argv[arg_index];
     }
@@ -1565,13 +1600,13 @@ main(int argc, char *argv[])
 #ifndef MEHCACHED_MEASURE_LATENCY
     if (num_positional < 1)
     {
-        printf("%s --num-items=N --alloc-size=N --concurrent-table-read=0|1 --concurrent-table-write=0|1 --concurrent-alloc-write=0|1 --thread-id=N --mth-threshold=F --prepopulate-nb-items=N --prepopulate-key-length=N --prepopulate-value-length=N CPU-MODE\n", argv[0]);
+        printf("%s --num-items=N --alloc-size=N --concurrent-table-read=0|1 --concurrent-table-write=0|1 --concurrent-alloc-write=0|1 --thread-id=N --mth-threshold=F --prepopulate-nb-items=N --prepopulate-key-length=N --prepopulate-value-length=N [--debug] CPU-MODE\n", argv[0]);
         return EXIT_FAILURE;
     }
 #else
     if (num_positional < 2)
     {
-        printf("%s --num-items=N --alloc-size=N --concurrent-table-read=0|1 --concurrent-table-write=0|1 --concurrent-alloc-write=0|1 --thread-id=N --mth-threshold=F --prepopulate-nb-items=N --prepopulate-key-length=N --prepopulate-value-length=N CPU-MODE TARGET-REQUEST-RATE\n", argv[0]);
+        printf("%s --num-items=N --alloc-size=N --concurrent-table-read=0|1 --concurrent-table-write=0|1 --concurrent-alloc-write=0|1 --thread-id=N --mth-threshold=F --prepopulate-nb-items=N --prepopulate-key-length=N --prepopulate-value-length=N [--debug] CPU-MODE TARGET-REQUEST-RATE\n", argv[0]);
         return EXIT_FAILURE;
     }
     target_request_rate_from_user = (uint32_t)atoi(positional[1]);

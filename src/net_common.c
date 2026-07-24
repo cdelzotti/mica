@@ -530,11 +530,18 @@ mehcached_init_network(uint64_t cpu_mask, uint64_t port_mask, uint8_t *out_num_p
 			return false;
 		}
 
-// 		// turn on promiscuous mode
-// #ifndef NDEBUG
-// 		printf("setting promiscuous mode on port %hhu...\n", port_id);
-// #endif
-// 		rte_eth_promiscuous_enable(port_id);
+		// without this, the NIC's own hardware L2 filter silently drops any frame whose dst MAC
+		// doesn't exactly match the port's configured address -- before it ever reaches an RX
+		// queue or gets a chance to be matched against an rte_flow rule. rte_eth_promiscuous_enable()
+		// now returns an int status (used to be void) that must be checked like the other rte_eth_*
+		// calls in this file.
+		printf("setting promiscuous mode on port %hhu...\n", port_id);
+		ret = rte_eth_promiscuous_enable(port_id);
+		if (ret != 0)
+		{
+			fprintf(stderr, "failed to enable promiscuous mode on port %hhu (err=%d)\n", port_id, ret);
+			return false;
+		}
 	}
 
 	// the following takes some time, but this ensures the device ready for full speed RX/TX when the initialization is done
