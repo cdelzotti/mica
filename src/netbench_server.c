@@ -253,7 +253,6 @@ mehcached_benchmark_server_proc(void *arg)
     uint8_t thread_id = (uint8_t)rte_lcore_id();
     struct server_state *state = states[thread_id];
     struct mehcached_server_conf *server_conf = state->server_conf;
-    struct mehcached_server_thread_conf *thread_conf = &server_conf->threads[thread_id];
 
     // for single core performance test
     // if (thread_id != 0 && thread_id != 1)
@@ -325,8 +324,10 @@ mehcached_benchmark_server_proc(void *arg)
     const size_t stage_gap = 2;
 #endif
 
-    // each thread polls a single fixed queue (== its own lcore id) on its one assigned port -- no round-robin across ports
-    uint8_t port_id = thread_conf->port_id;
+    // one port per application instance (see mehcached_server_conf.num_ports) -- every thread
+    // polls a single fixed queue (== its own lcore id) on that one port, which DPDK always
+    // enumerates as port 0
+    uint8_t port_id = 0;
 
     while (!exiting)
     {
@@ -1050,7 +1051,8 @@ mehcached_diagnosis(struct mehcached_server_conf *server_conf)
 
                         correct_queue = thread_id == expected_thread_id;
 
-                        correct_port = server_conf->threads[expected_thread_id].port_id == port_id;
+                        // one port per application instance -- every thread's queue lives on port 0
+                        correct_port = port_id == 0;
                     }
                 }
                 else
@@ -1219,9 +1221,13 @@ mehcached_benchmark_prepopulate_proc(void *arg)
 
 static
 void
-mehcached_benchmark_server(const char *machine_filename, const char *server_name, int cpu_mode, const char *prepopulation_filename)
+mehcached_benchmark_server(const struct mehcached_server_partition_conf *partition_conf, const char *server_name, int cpu_mode, const char *prepopulation_filename)
 {
-    struct mehcached_server_conf *server_conf = mehcached_get_server_conf(machine_filename, server_name);
+    // the partition's config is now taken directly from CLI arguments (see main()) instead of a
+    // conf_machines_* file -- num_ports is filled in below once DPDK reports how many ports exist.
+    struct mehcached_server_conf *server_conf = malloc(sizeof(struct mehcached_server_conf));
+    memset(server_conf, 0, sizeof(struct mehcached_server_conf));
+    server_conf->partition = *partition_conf;
     struct mehcached_prepopulation_conf *prepopulation_conf = mehcached_get_prepopulation_conf(prepopulation_filename, server_name);
 
     mehcached_stopwatch_init_start();
@@ -1525,23 +1531,54 @@ mehcached_benchmark_server(const char *machine_filename, const char *server_name
 int
 main(int argc, const char *argv[])
 {
-#ifndef MEHCACHED_MEASURE_LATENCY
-    if (argc < 5)
+    // the partition's config used to come from a conf_machines_* file; it's now taken directly as
+    // named CLI arguments, since a single instance only ever describes its own one partition.
+    struct mehcached_server_partition_conf partition;
+    memset(&partition, 0, sizeof(partition));
+
+    const char *positional[4];
+    int num_positional = 0;
+
+    int arg_index;
+    for (arg_index = 1; arg_index < argc; arg_index++)
     {
-        printf("%s MACHINE-FILENAME SERVER-NAME CPU-MODE PREPOPULATION-FILENAME\n", argv[0]);
+        uint64_t u64_value;
+        int int_value;
+        double double_value;
+        if (sscanf(argv[arg_index], "--num-items=%lu", &u64_value) == 1)
+            partition.num_items = u64_value;
+        else if (sscanf(argv[arg_index], "--alloc-size=%lu", &u64_value) == 1)
+            partition.alloc_size = u64_value;
+        else if (sscanf(argv[arg_index], "--concurrent-table-read=%d", &int_value) == 1)
+            partition.concurrent_table_read = (uint8_t)int_value;
+        else if (sscanf(argv[arg_index], "--concurrent-table-write=%d", &int_value) == 1)
+            partition.concurrent_table_write = (uint8_t)int_value;
+        else if (sscanf(argv[arg_index], "--concurrent-alloc-write=%d", &int_value) == 1)
+            partition.concurrent_alloc_write = (uint8_t)int_value;
+        else if (sscanf(argv[arg_index], "--thread-id=%d", &int_value) == 1)
+            partition.thread_id = (uint8_t)int_value;
+        else if (sscanf(argv[arg_index], "--mth-threshold=%lf", &double_value) == 1)
+            partition.mth_threshold = double_value;
+        else if (num_positional < 4)
+            positional[num_positional++] = argv[arg_index];
+    }
+
+#ifndef MEHCACHED_MEASURE_LATENCY
+    if (num_positional < 3)
+    {
+        printf("%s --num-items=N --alloc-size=N --concurrent-table-read=0|1 --concurrent-table-write=0|1 --concurrent-alloc-write=0|1 --thread-id=N --mth-threshold=F SERVER-NAME CPU-MODE PREPOPULATION-FILENAME\n", argv[0]);
         return EXIT_FAILURE;
     }
 #else
-    if (argc < 6)
+    if (num_positional < 4)
     {
-        printf("%s MACHINE-FILENAME SERVER-NAME CPU-MODE PREPOPULATION-FILENAME TARGET-REQUEST-RATE\n", argv[0]);
+        printf("%s --num-items=N --alloc-size=N --concurrent-table-read=0|1 --concurrent-table-write=0|1 --concurrent-alloc-write=0|1 --thread-id=N --mth-threshold=F SERVER-NAME CPU-MODE PREPOPULATION-FILENAME TARGET-REQUEST-RATE\n", argv[0]);
         return EXIT_FAILURE;
     }
-    target_request_rate_from_user = (uint32_t)atoi(argv[5]);
+    target_request_rate_from_user = (uint32_t)atoi(positional[3]);
 #endif
 
-
-    mehcached_benchmark_server(argv[1], argv[2], atoi(argv[3]), argv[4]);
+    mehcached_benchmark_server(&partition, positional[0], atoi(positional[1]), positional[2]);
 
     return EXIT_SUCCESS;
 }

@@ -18,15 +18,9 @@
 #include "net_common.h"
 
 //#define MEHCACHED_MAX_PORTS (8)
-#define MEHCACHED_MAX_THREADS (16)
 #define MEHCACHED_MAX_PARTITIONS (64)	// still used by microbench.c's own local (non-networked) multi-partition benchmark
 
 // server
-struct mehcached_server_thread_conf
-{
-	uint8_t port_id;	// each server thread polls a single fixed queue on a single port -- no per-thread port list any more
-};
-
 struct mehcached_server_partition_conf
 {
 	uint64_t num_items;
@@ -42,10 +36,10 @@ struct mehcached_server_conf
 {
 	uint8_t num_ports;	// not read from config at all any more -- set from however many ports
 				// DPDK actually reports (see mehcached_init_network()/netbench_server.c)
-	struct mehcached_server_thread_conf threads[MEHCACHED_MAX_THREADS];
 	// a single DPDK application instance now serves exactly one partition -- no partition array,
-	// no in-process partition routing. To serve multiple partitions, run one instance per
-	// partition (each on its own port/--file-prefix); see net_common.c/gen_confs.py.
+	// no in-process partition routing, and no config file either: the partition fields are taken
+	// directly as CLI arguments now (see main() in netbench_server.c). To serve multiple
+	// partitions, run one instance per partition (each on its own port/--file-prefix).
 	struct mehcached_server_partition_conf partition;
 };
 
@@ -65,8 +59,5 @@ struct mehcached_prepopulation_conf
 
 
 // functions
-struct mehcached_server_conf *
-mehcached_get_server_conf(const char *filename, const char *server_name);
-
 struct mehcached_prepopulation_conf *
 mehcached_get_prepopulation_conf(const char *filename, const char *server_name);
