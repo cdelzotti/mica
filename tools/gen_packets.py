@@ -13,29 +13,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Craft and send MICA-protocol packets with scapy.
+"""Craft and send MICA-protocol packets with scapy to verify a running
+netbench_server, in three steps:
 
-This is a small testing tool to sanity-check a running netbench_server: it
-builds requests using MICA's own binary wire format (see ../src/proto.h and
-../src/table.h), sends them as raw Ethernet/IPv4/UDP frames, and decodes
-whatever the server sends back. It is meant to answer "is MICA working?",
-not to measure performance -- it sends one request at a time and prints what
-happened. For real load generation, write (or point MICA at) a dedicated
-benchmarking client instead.
+  1) the server answers at all (a NOOP_READ request gets a reply);
+  2) if the server was started with --prepopulate-*, that data is really
+     there (a sample of it is read back and checked byte-for-byte);
+  3) the server actually stores data (a SET followed by a GET round-trips
+     the value).
+
+It builds requests using MICA's own binary wire format (see ../src/proto.h
+and ../src/table.h) and sends them as raw Ethernet/IPv4/UDP frames. It is
+meant to answer "is MICA working?", not to measure performance -- it sends
+one request at a time and prints what happened. For real load generation,
+write (or point MICA at) a dedicated benchmarking client instead.
 
 Requires scapy and, like the rest of MICA, raw-socket privileges (run as
 root, or grant the interpreter CAP_NET_RAW/CAP_NET_ADMIN).
 
 Examples:
 
-    # set a key, then read it back, and check the value round-trips
-    sudo ./gen_packets.py --iface eth0 --dst-mac aa:bb:cc:dd:ee:ff selftest
+    # just steps 1 and 3 (no --prepopulate-* given -> step 2 is skipped,
+    # exactly like the server itself skips prepopulation when those flags
+    # are omitted)
+    sudo ./gen_packets.py --iface eth0 --dst-mac aa:bb:cc:dd:ee:ff
 
-    # send one raw request and print the reply
+    # all three steps -- pass the *same* --prepopulate-* values you started
+    # the server with, so step 2 knows what to expect
     sudo ./gen_packets.py --iface eth0 --dst-mac aa:bb:cc:dd:ee:ff \\
-        send --op set --key hello --value world
-    sudo ./gen_packets.py --iface eth0 --dst-mac aa:bb:cc:dd:ee:ff \\
-        send --op get --key hello
+        --prepopulate-nb-items 1000000 --prepopulate-key-length 8 \\
+        --prepopulate-value-length 8
 """
 
 import argparse
@@ -225,20 +232,6 @@ MEHCACHED_TEST = 5
 MEHCACHED_DELETE = 6
 MEHCACHED_INCREMENT = 7
 
-# netbench_server.c's request-processing switch only implements these -- a
-# DELETE or TEST request falls into its "default" case, which just logs
-# "invalid operation" and leaves the request untouched (so it would look
-# like a false success if we let you send one). Only expose what the server
-# actually does something with.
-OPERATIONS = {
-    "noop-read": MEHCACHED_NOOP_READ,
-    "noop-write": MEHCACHED_NOOP_WRITE,
-    "add": MEHCACHED_ADD,
-    "set": MEHCACHED_SET,
-    "get": MEHCACHED_GET,
-    "increment": MEHCACHED_INCREMENT,
-}
-
 RESULT_NAMES = {
     0: "OK",
     1: "ERROR",
@@ -266,11 +259,18 @@ def kv_length_vec(key_length, value_length):
     return ((key_length & 0xFF) << 24) | (value_length & 0xFFFFFF)
 
 
-def build_request(operation, key, value=b"", expire_time=0):
-    """Return (request_header_bytes, trailing_data_bytes) for one request."""
+def build_request(operation, key, value=b"", expire_time=0, key_hash=None):
+    """Return (request_header_bytes, trailing_data_bytes) for one request.
+
+    key_hash defaults to CityHash64(key), which is correct for anything this
+    tool itself SETs. Pass it explicitly to override -- needed to read back
+    the server's --prepopulate-* dataset, whose entries are stored under a
+    key_hash computed from something other than the stored key bytes (see
+    prepopulate_key_hash() below)."""
     key = bytes(key)
     value = bytes(value)
-    key_hash = city_hash64(key)
+    if key_hash is None:
+        key_hash = city_hash64(key)
     # a GET carries no value payload at all -- the server only ever reads
     # 'value_length' bytes after the key, and writes its own result there
     value_length = 0 if operation == MEHCACHED_GET else len(value)
@@ -284,16 +284,19 @@ def build_request(operation, key, value=b"", expire_time=0):
 
 
 def build_batch_packet(requests):
-    """requests: list of (operation, key, value, expire_time). Returns the
-    bytes that belong after the Ethernet/IPv4/UDP headers -- i.e. struct
+    """requests: list of (operation, key, value, expire_time) or
+    (operation, key, value, expire_time, key_hash). Returns the bytes that
+    belong after the Ethernet/IPv4/UDP headers -- i.e. struct
     mehcached_batch_packet from 'num_requests' onward. The headers themselves
     are built by scapy (Ether/IP/UDP), not here."""
     if not (1 <= len(requests) <= MEHCACHED_MAX_BATCH_SIZE):
         raise ValueError(f"a batch must have between 1 and {MEHCACHED_MAX_BATCH_SIZE} requests")
     headers = b""
     data = b""
-    for operation, key, value, expire_time in requests:
-        h, d = build_request(operation, key, value, expire_time)
+    for request in requests:
+        operation, key, value, expire_time = request[:4]
+        key_hash = request[4] if len(request) > 4 else None
+        h, d = build_request(operation, key, value, expire_time, key_hash)
         headers += h
         data += d
     return struct.pack("<BBI", len(requests), 0, 0) + headers + data
@@ -330,13 +333,78 @@ def parse_batch_packet(payload):
 
 
 # ---------------------------------------------------------------------------
+# Prepopulation dataset -- a pure-Python port of
+# mehcached_benchmark_prepopulate_proc() in ../src/netbench_server.c.
+#
+# netbench_server's --prepopulate-nb-items/--prepopulate-key-length/
+# --prepopulate-value-length flags make it fill its table with a synthetic
+# dataset at startup, before any client ever sends a request. To read that
+# data back we have to reproduce, byte for byte, three things the server
+# derives from each item's integer index:
+#
+#   1. the key bytes it stores (a variable-length, nibble-per-slot encoding
+#      of index+1 -- NOT an ASCII hex string);
+#   2. the key_hash it stores the item under. Surprisingly this is NOT
+#      CityHash64 of those key bytes: mehcached_hash_key() in
+#      netbench_server.c hashes the raw 8-byte little-endian index itself
+#      (see mehcached_hash_key()/mehcached_benchmark_prepopulate_proc() in
+#      ../src/netbench_server.c). mehcached_get() matches on key_hash and key
+#      bytes exactly as given (src/table.c), so a GET with the "wrong" hash
+#      -- e.g. CityHash64 of the key bytes, as this tool's own SET/GET
+#      traffic uses -- looks up the wrong bucket and comes back NOT_FOUND
+#      even though the data is really there.
+#   3. the value bytes it stores: (index & 0xffffffff) | ((~index &
+#      0xffffffff) << 32), little-endian, truncated/zero-padded to
+#      value_length.
+# ---------------------------------------------------------------------------
+
+def prepopulate_key_position_step(key_length, num_items):
+    log16_num_items = 0
+    while (1 << (log16_num_items * 4)) < (num_items + 1):
+        log16_num_items += 1
+    step = key_length // log16_num_items
+    return step if step != 0 else 1
+
+
+def prepopulate_key_bytes(key_index, key_position_step):
+    """The key bytes stored for this index: index+1 written in base 16, one
+    nibble (as a raw byte 0-15, not an ASCII digit) per key_position_step-byte
+    slot, most-significant nibble first."""
+    n = key_index + 1
+    key_length = 0
+    while n > 0:
+        n >>= 4
+        key_length += key_position_step
+    buf = bytearray(key_length)
+    n = key_index + 1
+    char_index = key_length
+    while n > 0:
+        char_index -= key_position_step
+        buf[char_index] = n & 15
+        n >>= 4
+    return bytes(buf)
+
+
+def prepopulate_key_hash(key_index):
+    return city_hash64(struct.pack("<Q", key_index & _MASK64))
+
+
+def prepopulate_value_bytes(key_index, value_length):
+    value = (key_index & 0xFFFFFFFF) | ((~key_index & 0xFFFFFFFF) << 32)
+    full = struct.pack("<Q", value & _MASK64)
+    if value_length <= 8:
+        return full[:value_length]
+    return full + b"\0" * (value_length - 8)
+
+
+# ---------------------------------------------------------------------------
 # packet I/O
 # ---------------------------------------------------------------------------
 
 def send_batch(args, requests, wait_reply=True):
-    """Send one batch (list of (operation, key, value, expire_time)) to the
-    server and, unless wait_reply is False, return the decoded reply (a list
-    of request dicts, see parse_batch_packet) or None on timeout."""
+    """Send one batch (list of (operation, key, value, expire_time[, key_hash]))
+    to the server and, unless wait_reply is False, return the decoded reply
+    (a list of request dicts, see parse_batch_packet) or None on timeout."""
     payload = build_batch_packet(requests)
     src_mac = args.src_mac or get_if_hwaddr(args.iface)
     sport = args.sport or random.randint(1024, 65535)
@@ -363,51 +431,94 @@ def send_batch(args, requests, wait_reply=True):
     return parse_batch_packet(bytes(reply[UDP].payload))
 
 
-def describe_request(index, operation_name, result, key, value):
-    result_name = RESULT_NAMES.get(result, f"UNKNOWN({result})")
-    if operation_name == "get":
-        shown_value = value if value is not None else b""
-        print(f"  [{index}] {operation_name} {key!r} -> {result_name} value={shown_value!r}")
-    elif operation_name == "increment":
-        shown = struct.unpack("<Q", value)[0] if value and len(value) == 8 else value
-        print(f"  [{index}] {operation_name} {key!r} -> {result_name} new_value={shown}")
-    else:
-        print(f"  [{index}] {operation_name} {key!r} -> {result_name}")
-
-
 # ---------------------------------------------------------------------------
-# subcommands
+# verification steps
 # ---------------------------------------------------------------------------
 
-def cmd_send(args):
-    operation = OPERATIONS[args.op]
-    key = args.key.encode()
-    if args.op == "increment":
-        value = struct.pack("<Q", int(args.value))
-    elif args.op in ("set", "add"):
-        value = args.value.encode() if args.value is not None else b""
-    else:
-        value = b""
-
-    if args.no_wait:
-        send_batch(args, [(operation, key, value, args.expire_time)], wait_reply=False)
-        print("sent (not waiting for a reply)")
-        return 0
-
-    reply = send_batch(args, [(operation, key, value, args.expire_time)])
+def step_ping(args):
+    """Step 1: the server answers at all. A NOOP_READ touches no data (see
+    the MEHCACHED_NOOP_READ/MEHCACHED_NOOP_WRITE case in src/table.c, which
+    always just sets result = MEHCACHED_OK) -- it only proves the packet
+    format, MAC/routing, and the server's request loop are all working."""
+    print(f"[1/3] checking that the server answers ({args.dst_mac} via {args.iface}, dport {args.dport})")
+    reply = send_batch(args, [(MEHCACHED_NOOP_READ, b"", b"", 0)])
     if reply is None:
-        print("no reply received (timeout)", file=sys.stderr)
-        return 1
+        print("  no reply received (timeout)")
+        return False
+    result = reply[0]["result"]
+    if result != 0:
+        print(f"  unexpected result: {RESULT_NAMES.get(result, result)}")
+        return False
+    print("  server replied: OK")
+    return True
 
-    req = reply[0]
-    describe_request(0, args.op, req["result"], key, req["value"])
-    return 0 if req["result"] == 0 else 1
 
+def step_check_prepopulate(args):
+    """Step 2: if the server was started with --prepopulate-*, verify a
+    sample of that dataset is really there. Skipped (like the server itself
+    skips prepopulation) when --prepopulate-nb-items is 0."""
+    num_items = args.prepopulate_nb_items
+    key_length = args.prepopulate_key_length
+    value_length = args.prepopulate_value_length
 
-def cmd_selftest(args):
-    print(f"running {args.count} SET/GET round-trip check(s) against {args.dst_mac} via {args.iface}")
+    print("[2/3] checking prepopulated data")
+    if num_items == 0:
+        print("  --prepopulate-nb-items=0: nothing to check, skipping")
+        return None
+
+    key_position_step = prepopulate_key_position_step(key_length, num_items)
+    sample_count = max(1, min(args.prepopulate_sample_count, num_items))
+    if sample_count == 1:
+        indices = [0]
+    else:
+        indices = sorted({round(i * (num_items - 1) / (sample_count - 1)) for i in range(sample_count)})
+
+    print(
+        f"  sampling {len(indices)} of {num_items} item(s) "
+        f"(key_length={key_length}, value_length={value_length}, key_position_step={key_position_step})"
+    )
+
+    batch_size = max(1, min(args.prepopulate_batch_size, MEHCACHED_MAX_BATCH_SIZE))
     failures = 0
-    for i in range(args.count):
+    checked = 0
+    for start in range(0, len(indices), batch_size):
+        chunk = indices[start:start + batch_size]
+        requests = [
+            (MEHCACHED_GET, prepopulate_key_bytes(key_index, key_position_step), b"", 0, prepopulate_key_hash(key_index))
+            for key_index in chunk
+        ]
+
+        reply = send_batch(args, requests)
+        if reply is None:
+            print(f"  key_index {chunk[0]}..{chunk[-1]}: no reply (timeout)")
+            failures += len(chunk)
+            checked += len(chunk)
+            continue
+
+        for key_index, req in zip(chunk, reply):
+            checked += 1
+            expected_value = prepopulate_value_bytes(key_index, value_length)
+            result = req["result"]
+            if result != 0:
+                print(f"  [{key_index}] key={req['key']!r}: FAILED ({RESULT_NAMES.get(result, result)})")
+                failures += 1
+            elif req["value"] != expected_value:
+                print(
+                    f"  [{key_index}] key={req['key']!r}: value mismatch, "
+                    f"expected {expected_value!r}, got {req['value']!r}"
+                )
+                failures += 1
+
+    print(f"  {checked - failures}/{checked} prepopulated item(s) verified")
+    return failures == 0
+
+
+def step_round_trip(args):
+    """Step 3: the server actually stores data -- SET then GET a handful of
+    fresh keys and check the values round-trip correctly."""
+    print(f"[3/3] SET/GET round-trip check ({args.round_trip_count} key(s))")
+    failures = 0
+    for i in range(args.round_trip_count):
         key = f"{args.key_prefix}-{i}".encode()
         value = f"{args.value_prefix}-{i}".encode()
 
@@ -438,9 +549,9 @@ def cmd_selftest(args):
         else:
             print(f"  [{i}] {key!r} -> {value!r}: OK")
 
-    total = args.count
-    print(f"\n{total - failures}/{total} round-trip(s) passed")
-    return 0 if failures == 0 else 1
+    total = args.round_trip_count
+    print(f"  {total - failures}/{total} round-trip(s) passed")
+    return failures == 0
 
 
 # ---------------------------------------------------------------------------
@@ -449,7 +560,8 @@ def cmd_selftest(args):
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(
-        description="Craft and send MICA-protocol packets with scapy, to sanity-check a running netbench_server.",
+        description="Verify a running netbench_server in 3 steps: it answers, its prepopulated "
+        "data (if any) is there, and it actually stores SET data.",
     )
     parser.add_argument("--iface", required=True, help="network interface to send/receive on")
     parser.add_argument(
@@ -469,23 +581,39 @@ def build_arg_parser():
     )
     parser.add_argument("--timeout", type=float, default=2.0, help="seconds to wait for a reply (default: 2.0)")
 
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    p_send = sub.add_parser("send", help="send a single request and print the reply")
-    p_send.add_argument("--op", choices=sorted(OPERATIONS), required=True, help="operation to send")
-    p_send.add_argument("--key", required=True, help="key, as a UTF-8 string")
-    p_send.add_argument("--value", default=None, help="value: a UTF-8 string for set/add, an integer for increment")
-    p_send.add_argument("--expire-time", type=int, default=0, help="expire_time field to send (default: 0)")
-    p_send.add_argument("--no-wait", action="store_true", help="fire and forget, don't wait for a reply")
-    p_send.set_defaults(func=cmd_send)
-
-    p_selftest = sub.add_parser(
-        "selftest", help="SET then GET a handful of keys and check the values round-trip correctly"
+    # step 2: same --prepopulate-* names/semantics as netbench_server itself (see src/netbench_server.c
+    # main()), defaulting to 0 just like the server's own zero-initialized config -- i.e. step 2 is
+    # skipped unless you pass the same values you started the server with.
+    parser.add_argument(
+        "--prepopulate-nb-items", type=int, default=0,
+        help="must match the server's --prepopulate-nb-items=N (default: 0, i.e. skip step 2)",
     )
-    p_selftest.add_argument("--count", type=int, default=4, help="number of distinct keys to round-trip (default: 4)")
-    p_selftest.add_argument("--key-prefix", default="gen_packets-selftest-key", help="prefix for generated test keys")
-    p_selftest.add_argument("--value-prefix", default="gen_packets-selftest-value", help="prefix for generated test values")
-    p_selftest.set_defaults(func=cmd_selftest)
+    parser.add_argument(
+        "--prepopulate-key-length", type=int, default=0,
+        help="must match the server's --prepopulate-key-length=N",
+    )
+    parser.add_argument(
+        "--prepopulate-value-length", type=int, default=0,
+        help="must match the server's --prepopulate-value-length=N",
+    )
+    parser.add_argument(
+        "--prepopulate-sample-count", type=int, default=16,
+        help="number of prepopulated items to sample and verify in step 2, evenly spaced across "
+        "the full [0, nb-items) range (default: 16)",
+    )
+    parser.add_argument(
+        "--prepopulate-batch-size", type=int, default=MEHCACHED_MAX_BATCH_SIZE,
+        help=f"GET requests per batch packet in step 2, 1-{MEHCACHED_MAX_BATCH_SIZE} "
+        f"(default: {MEHCACHED_MAX_BATCH_SIZE})",
+    )
+
+    # step 3
+    parser.add_argument(
+        "--round-trip-count", type=int, default=4,
+        help="number of distinct keys to SET then GET in step 3 (default: 4)",
+    )
+    parser.add_argument("--key-prefix", default="gen_packets-verify-key", help="prefix for step 3's generated test keys")
+    parser.add_argument("--value-prefix", default="gen_packets-verify-value", help="prefix for step 3's generated test values")
 
     return parser
 
@@ -493,7 +621,31 @@ def build_arg_parser():
 def main():
     parser = build_arg_parser()
     args = parser.parse_args()
-    return args.func(args)
+
+    ok1 = step_ping(args)
+
+    ok2 = None
+    ok3 = None
+    if ok1:
+        print()
+        ok2 = step_check_prepopulate(args)
+        print()
+        ok3 = step_round_trip(args)
+    else:
+        print("\nserver did not answer step 1 -- skipping steps 2 and 3")
+
+    def status(ok):
+        if ok is None:
+            return "SKIPPED"
+        return "OK" if ok else "FAILED"
+
+    print("\n=== summary ===")
+    print(f"1) server answers:       {status(ok1)}")
+    print(f"2) prepopulated data:    {status(ok2)}")
+    print(f"3) SET/GET round-trip:   {status(ok3)}")
+
+    passed = ok1 and ok2 is not False and ok3 is not False
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":

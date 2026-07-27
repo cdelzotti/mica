@@ -1,5 +1,9 @@
 build/
 venv/
 *.dnc
+*.pcap
+tools/__pycache__/*
+
+
 perf.data
 perf.data.old

@@ -97,33 +97,92 @@ synthetic key-value pairs before it starts accepting any real requests. **This d
 random -- it is fully deterministic and reproducible**, generated the same way on every run:
 
 - Keys are simply the integers `0` to `--prepopulate-nb-items - 1`, each encoded as a
-  variable-length hexadecimal string padded to `--prepopulate-key-length` bytes, and hashed with
-  the exact same scheme (`mehcached_hash_key()`) real requests are hashed with.
+  variable-length string of nibbles (index `i + 1` in base 16) sized up to
+  `--prepopulate-key-length` bytes -- **not** an ASCII hex string.
+- The `key_hash` each item is stored under is *not* `CityHash64` of that encoded key. It's
+  `mehcached_hash_key()`'s hash of the raw 8-byte index itself, computed before the index is ever
+  turned into the stored key bytes above.
 - Values are a fixed, self-verifying 8-byte bit pattern derived from the key's index (the low and
   high 32 bits are bitwise complements of each other), zero-padded to `--prepopulate-value-length`
   bytes. They are placeholder data for exercising the store, not meaningful content.
 
-Because key generation is deterministic, an external client that wants to read back prepopulated
-keys (e.g. to issue `GET`s against a warmed-up table instead of only `SET`s) must generate keys
-the same way: index `i` maps to the same hexadecimal encoding and the same `mehcached_hash_key()`
-hash used above. Setting `--prepopulate-nb-items=0` (the default) skips prepopulation entirely and
-the server starts with an empty table.
+Because generation is deterministic, an external client that wants to read back prepopulated keys
+(e.g. to issue `GET`s against a warmed-up table instead of only `SET`s) must reproduce all three of
+the above exactly for a given index -- key bytes *and* key_hash *and* expected value -- or a lookup
+with the "obvious" hash (`CityHash64` of the key bytes) will land on the wrong bucket and come back
+`NOT_FOUND` even though the data is there. Setting `--prepopulate-nb-items=0` (the default) skips
+prepopulation entirely and the server starts with an empty table. `tools/gen_packets.py` (see
+"Runtime considerations" below) automates this reproduction and verifies it.
 
 ## Runtime considerations
 
 MICA has no client of its own -- whatever sends it requests must speak its wire format directly.
 `tools/gen_packets.py` is a small scapy-based script that does exactly that: it builds
-protocol-correct requests, sends them, and decodes the reply, either as a one-off (`send`) or as a
-SET/GET round-trip check (`selftest`). It is meant to answer "is MICA working?", not to generate
-load -- see the script's own `--help` for usage.
+protocol-correct requests, sends them, and decodes the reply, to verify a running server in three
+steps:
+
+1. **it answers at all** -- a `NOOP_READ` gets a reply;
+2. **its prepopulated data (if any) is there** -- a sample of the `--prepopulate-*` dataset (see
+   above) is read back and checked byte-for-byte, using the same key/hash/value derivation as the
+   server;
+3. **it actually stores data** -- a `SET` followed by a `GET` round-trips the value.
+
+It is meant to answer "is MICA working?", not to generate load -- see the script's own `--help`
+for the full list of flags.
 
 ```sh
 # --dst-mac is the NIC MAC netbench_server printed at startup ("port 0 MAC: ...")
-sudo ./tools/gen_packets.py --iface eth0 --dst-mac b8:3f:d2:37:42:4e selftest
 
-sudo ./tools/gen_packets.py --iface eth0 --dst-mac b8:3f:d2:37:42:4e send --op set --key hello --value world
-sudo ./tools/gen_packets.py --iface eth0 --dst-mac b8:3f:d2:37:42:4e send --op get --key hello
+# steps 1 and 3 only -- no --prepopulate-* given, so step 2 is skipped just like the server itself
+# skips prepopulation when those flags are omitted
+sudo ./tools/gen_packets.py --iface eth0 --dst-mac b8:3f:d2:37:42:4e
+
+# all three steps -- pass the *same* --prepopulate-* values you started the server with
+sudo ./tools/gen_packets.py --iface eth0 --dst-mac b8:3f:d2:37:42:4e \
+    --prepopulate-nb-items 1000000 --prepopulate-key-length 8 --prepopulate-value-length 8
 ```
+
+`tools/CLIent.py` is an interactive REPL built on the same wire-format code (it imports directly
+from `gen_packets.py`), for poking at a server by hand instead of running a fixed check:
+
+```sh
+sudo ./tools/CLIent.py --iface eth0 --dst-mac b8:3f:d2:37:42:4e
+```
+
+```
+mica> SET hello world
+OK
+mica> GET hello
+world
+mica> GET nosuchkey
+NOT_FOUND
+mica> exit
+```
+
+`--dst-mac` has to be the server's real MAC here, not a placeholder -- `netbench_server`'s
+`rte_flow` rule steers each request to the partition-owning queue/thread by UDP destination port
+alone, but a broadcast or wrong-unicast destination can be flooded to (or classified onto) the
+wrong queue by the NIC itself before that rule ever applies, making every `SET`/`GET` fail.
+
+`tools/gen_trace.py` generates a `.pcap` trace of `SET`/`GET` requests for replay with a real
+load-generation tool (e.g. `tcpreplay`), rather than sending one request at a time like the two
+tools above:
+
+```sh
+./tools/gen_trace.py --nb-packets 1000000 --percentage-set 5 --percentage-get 95 \
+    --rate 100000 --dst-mac b8:3f:d2:37:42:4e --output workload.pcap
+
+# then, on the machine wired to the server:
+sudo tcpreplay --intf1=eth0 --pps=100000 workload.pcap
+```
+
+It only builds and serializes packets, so unlike the other two tools it needs neither an interface
+nor raw-socket privileges to run -- `--dst-mac` is still required, though, since it's baked into the
+generated packets and (for the reason above) determines real queue routing once the trace is
+replayed. The requested `--percentage-set`/`--percentage-get` split is respected exactly (they must
+add up to 100), and `GET`s only ever reference a key an earlier `SET` in the trace already wrote, so
+replaying it produces real hits instead of a stream of `NOT_FOUND`s (the one unavoidable exception:
+`--percentage-set 0` has no prior `SET`s to hit, so every `GET` misses by construction).
 
 A request packet looks like this, from Ethernet up to MICA's own application layer:
 
@@ -154,10 +213,17 @@ On that `key_hash` field: MICA's table code (`src/table.c`) never re-derives it 
 it just trusts whatever the request carries and uses it directly for bucket addressing and the
 stored-item match check -- hashing is pushed onto whatever generates the request instead of being
 redone by the server every time. A client that only ever reads back keys it wrote itself could use
-any deterministic hash function and still work correctly. To also read back the data
-`--prepopulate-*` loaded (see above), a client's hash must match the server's own
-`mehcached_hash_key()` (`CityHash64`, from `src/city.c`) exactly -- which is what `gen_packets.py`
-does, having been checked byte-for-byte against the real C implementation.
+any deterministic hash function and still work correctly (this is what `gen_packets.py`'s own
+`SET`/`GET` round-trip, step 3 above, does: it hashes with `CityHash64` of the key bytes).
+
+To also read back the data `--prepopulate-*` loaded (see above), a client needs more than a
+matching hash *function* -- the prepopulated `key_hash` isn't `CityHash64` of the stored key bytes
+at all. `mehcached_hash_key()` in `src/netbench_server.c` hashes the raw 8-byte index itself, before
+it's ever turned into the hexadecimal key that's actually stored; a `GET` using
+`CityHash64(key_bytes)`, as anything hashing its own keys would, looks up the wrong bucket and comes
+back `NOT_FOUND` even though the data is really there. `gen_packets.py`'s step 2 reproduces both the
+key encoding and this index-based hash exactly (`prepopulate_key_bytes()`/`prepopulate_key_hash()`
+in the script), having been checked byte-for-byte against the real C implementation.
 
 ## License
 
